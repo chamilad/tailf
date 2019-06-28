@@ -1,2 +1,5 @@
 #ide
 .idea/
+
+# test files
+*.logs
