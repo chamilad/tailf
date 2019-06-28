@@ -29,6 +29,9 @@ func main() {
 		lcount = 0
 		fname = args[0]
 	}
+
+	// TODO: abs fname
+
 	// check if file exists
 	f, err := os.Open(fname)
 	// close the handler later
@@ -40,6 +43,7 @@ func main() {
 
 	// if a line count is provided, rewind cursor
 	// the file should be read from the end, backwards
+	// TODO: handle f == nil
 	f = seekBackwardsToLineCount(lcount, f)
 
 	// wait for new lines to appear
@@ -67,13 +71,28 @@ func seekBackwardsToLineCount(lc int, f *os.File) *os.File {
 	// line count counter
 	l := 0
 	// offset counter, negative because counting backwards
-	offset := -1
+	var offset int64 = -1
+
+	finfo, err := os.Stat(f.Name())
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "error while getting fileinfo: %s", f.Name())
+		return nil
+	}
+
+	fsize := finfo.Size()
 
 	// loop until lc is passed
 	for ; ; offset-- {
+		// check if we are past the file start
+		if offset+fsize == 0 {
+			// if so, return this position, there's no room to backup
+			break
+		}
+
 		// seek backwards by offset from the end
 		p, err := f.Seek(int64(offset), io.SeekEnd)
 		if err != nil {
+			// TODO: refactor these logs
 			_, _ = fmt.Fprintf(os.Stderr, "error while seeking by char at %d: %s", offset, err)
 			return nil
 		}
@@ -102,7 +121,8 @@ func seekBackwardsToLineCount(lc int, f *os.File) *os.File {
 		}
 	}
 
-	_, err := f.Seek(int64(offset), io.SeekEnd)
+	// seek to the found position
+	_, err = f.Seek(int64(offset), io.SeekEnd)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "end: error while seeking by char at %d: %s", offset, err)
 		return nil
