@@ -7,16 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // usage: tailf <initial line count> <filename>
-// TODO: keep tailing the file during logrotate
 // TODO: parse flags better, consider various permutations of order of flags
 // TODO: manage filename flag
 // TODO: -h flag - show usage
@@ -26,6 +25,7 @@ import (
 // TODO: manage error messages
 // TODO: checkout magefile as a build system
 // TODO: tail multiple files in a dir matching a pattern
+// TODO: maintain all fds and wds in an internal structure and defer to close all
 func main() {
 	// args without bin name
 	if len(os.Args) == 1 {
@@ -55,19 +55,13 @@ func main() {
 	defer f.Close()
 	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
 
-	log.Println("creating inotify event")
+	//log.Println("creating inotify event")
 	// TODO: apparently syscall is deprecated, use sys pkg later
 	fd, err := syscall.InotifyInit()
 	handleErrorAndExit(err, fmt.Sprintf("error while registering inotify: %s", fname))
 
-	log.Println("adding watch")
-	wd, err := syscall.InotifyAddWatch(
-		fd,
-		fname,
-		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
-		//syscall.IN_ALL_EVENTS)
-
-	handleErrorAndExit(err, fmt.Sprintf("error while adding an inotify watch: %s", fname))
+	wd := watchFile(fd, fname)
+	//fmt.Printf("wd1: %d", wd)
 
 	//log.Println("seeks")
 	//n1, err:= f.Seek(0, io.SeekStart)
@@ -80,12 +74,12 @@ func main() {
 	// if a line count is provided, rewind cursor
 	// the file should be read from the end, backwards
 	// TODO: handle f == nil
-	log.Println("tailing last lines")
+	//log.Println("tailing last lines")
 	lastFSize := showLastLines(lcount, f)
 	// cursor is at EOF-1
 
 	defer func() {
-		syscall.InotifyRmWatch(fd, uint32(wd))
+		removeWatch(fd, wd)
 	}()
 
 	// this channel communicates the events
@@ -95,48 +89,82 @@ func main() {
 
 	for {
 		select {
+		// todo: need to verify if event is for currently watching file handler by comparing wd
 		case event := <-events:
 			switch event {
 			case syscall.IN_MOVE_SELF:
 				// file moved, close current file handler and open a new one
-				log.Println("FILE MOVED")
+				//log.Println("FILE MOVED")
 				f.Close()
-				// todo same file may not be available immediately, wait for it?
+
+				// wait for new file to appear
+				for {
+					_, err := os.Stat(fname)
+					if err == nil {
+						break
+					}
+
+					//log.Println("file not yet appeared")
+
+					// todo exponential backoff, give up after a certain time
+					time.Sleep(2 * time.Second)
+				}
+
+				// file appeared, open a new file handler
 				f, err = os.Open(fname)
 				handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
+
+				// remove existing inotify watch and add a new watch for the new file handler
+				removeWatch(fd, wd)
+				wd = watchFile(fd, fname)
+				//fmt.Printf("wd2: %d", wd)
 			case syscall.IN_MODIFY:
 				// file was written to or truncated, need to determine what happend
 				finfo, err := os.Stat(f.Name())
 				handleErrorAndExit(err, "error while sizing file during modify event")
 				if finfo.Size() > lastFSize {
-					log.Println("FILE WRITTEN")
+					//log.Println("FILE WRITTEN")
 					// file has been written into, ie "write()"
 					lastFSize = showFileContent(f)
 				} else if finfo.Size() < lastFSize {
-					log.Println("FILE TRUNCATED")
+					//log.Println("FILE TRUNCATED")
 					// file has been truncated
 					f.Seek(0, io.SeekStart)
 					lastFSize = showFileContent(f)
 				}
 			case syscall.IN_DELETE_SELF, syscall.IN_ATTRIB, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
 				// in ubuntu, rm sends an IN_ATTRIB possibly because of unlink()
-				log.Println("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
+				//log.Println("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
 				// file was deleted, exit?
 				f.Close()
 				os.Exit(0)
-			//default:
-				//h := fmt.Sprintf("%X", event)
-				//log.Printf("event received: %s\n", h)
-				//
-				//h = fmt.Sprintf("%X", syscall.IN_DELETE_SELF)
-				//log.Printf("delete self for comparison: %s\n", h)
-				//
-				//fmt.Printf("event == delete_Self : %v\n", event == syscall.IN_DELETE_SELF)
 			}
 		}
 	}
 }
 
+// removeWatch stops watching a file by removing a given watch
+// descriptor from the given inotify file descriptor
+func removeWatch(fd int, wd int) (int, error) {
+	return syscall.InotifyRmWatch(fd, uint32(wd))
+}
+
+// watchFile adds a new inotify watch for a given file at the given
+// inotify file descriptor.
+// Returns the created watch descriptor
+func watchFile(fd int, fname string) int {
+	//log.Println("adding watch")
+	wd, err := syscall.InotifyAddWatch(
+		fd,
+		fname,
+		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
+	//syscall.IN_ALL_EVENTS)
+	handleErrorAndExit(err, fmt.Sprintf("error while adding an inotify watch: %s", fname))
+	return wd
+}
+
+// handleErrorAndExit will exit with 1 if there is an error
+// todo: crude
 func handleErrorAndExit(e error, msg string) {
 	if e != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "%s: %s\n", msg, e)
@@ -144,11 +172,18 @@ func handleErrorAndExit(e error, msg string) {
 	}
 }
 
+// checkInotifyEvents runs an infinite loop reading the given inotify
+// file descriptor. The read() syscall is a blocking one until any data
+// is present. Once the inotify events are present, the events are
+// unmarshalled and the event mask is communicated to the consumer
+// At the moment, the read() call could close improperly if the main
+// thread gives out. Need a way to timeout based on a notification
+// from the main thread.
 func checkInotifyEvents(fd int, events chan<- uint32) {
 	for {
 		buf := make([]byte, (syscall.SizeofInotifyEvent+syscall.NAME_MAX+1)*10)
 		// read from the opened inotify file descriptor, into buf
-		log.Println("reading inotify event list")
+		//log.Println("reading inotify event list")
 		// read is blocking until len(buf) is available
 		n, err := syscall.Read(fd, buf)
 		handleErrorAndExit(err, "error while reading inotify file")
