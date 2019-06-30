@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,7 +60,7 @@ func main() {
 	// the file should be read from the end, backwards
 	// TODO: handle f == nil
 	log.Println("tailing last lines")
-	f = seekBackwardsToLineCount(lcount, f)
+	f = showLastLines(lcount, f)
 
 	log.Println("creating inotify event")
 	// TODO: apparently syscall is deprecated, use sys pkg later
@@ -147,11 +148,10 @@ func checkInotifyEvents(fd int, com chan<- string) {
 	}
 }
 
-// seekBackwardsToLineCount will move the read position of
-// the passed file until the specified line count from end
-// is met
+// showLastLines will move the read position of the passed
+// file until the specified line count from end is met
 // Returns the os.File reference which has a rewound cursor
-func seekBackwardsToLineCount(lc int, f *os.File) *os.File {
+func showLastLines(lc int, f *os.File) *os.File {
 	// line count counter
 	l := 0
 	// offset counter, negative because counting backwards
@@ -210,6 +210,19 @@ func seekBackwardsToLineCount(lc int, f *os.File) *os.File {
 		_, _ = fmt.Fprintf(os.Stderr, "end: error while seeking by char at %d: %s", offset, err)
 		return nil
 	}
+
+	// show the lines up to EOF
+	buf := make([]byte, int(math.Abs(float64(offset))))
+	n, err := f.Read(buf)
+	handleErrorAndExit(err, "couldn't read line count")
+
+	if n <= 0 {
+		handleErrorAndExit(errors.New(""), "reading file returned 0 or less bytes")
+	}
+
+	_, _ = fmt.Fprint(os.Stdout, string(buf[:n]))
+
+	// cursor is at EOF-1
 
 	return f
 }
