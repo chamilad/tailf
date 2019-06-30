@@ -64,8 +64,8 @@ func main() {
 	wd, err := syscall.InotifyAddWatch(
 		fd,
 		fname,
-		//syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
-		syscall.IN_ALL_EVENTS)
+		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
+		//syscall.IN_ALL_EVENTS)
 
 	handleErrorAndExit(err, fmt.Sprintf("error while adding an inotify watch: %s", fname))
 
@@ -118,26 +118,20 @@ func main() {
 					f.Seek(0, io.SeekStart)
 					lastFSize = showFileContent(f)
 				}
-			case syscall.IN_DELETE_SELF:
-				// todo rm action wasn't notified
+			case syscall.IN_DELETE_SELF, syscall.IN_ATTRIB, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
+				// in ubuntu, rm sends an IN_ATTRIB possibly because of unlink()
 				log.Println("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
 				// file was deleted, exit?
 				f.Close()
 				os.Exit(0)
-			case syscall.IN_DELETE:
-				// todo rm action wasn't notified
-				log.Println("FILE DELETED_2, IGNORED, OR UNMOUNTED, TIME TO DIE")
-				// file was deleted, exit?
-				f.Close()
-				os.Exit(0)
-			default:
-				h := fmt.Sprintf("%X", event)
-				log.Printf("event received: %s\n", h)
-
-				h = fmt.Sprintf("%X", syscall.IN_DELETE_SELF)
-				log.Printf("delete self for comparison: %s\n", h)
-
-				fmt.Printf("event == delete_Self : %v\n", event == syscall.IN_DELETE_SELF)
+			//default:
+				//h := fmt.Sprintf("%X", event)
+				//log.Printf("event received: %s\n", h)
+				//
+				//h = fmt.Sprintf("%X", syscall.IN_DELETE_SELF)
+				//log.Printf("delete self for comparison: %s\n", h)
+				//
+				//fmt.Printf("event == delete_Self : %v\n", event == syscall.IN_DELETE_SELF)
 			}
 		}
 	}
