@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -252,15 +251,20 @@ func showLastLines(lc int, f *os.File) int64 {
 		}
 
 		// read one char, a new reader is needed from seeked File ref
-		r := bufio.NewReader(f)
-		b, err := r.ReadByte()
+		buf := make([]byte, 1)
+		n, err := f.Read(buf)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "error while reading char at %d: %s", p, err)
 			return 0
 		}
 
+		if n <= 0 {
+			_, _ = fmt.Fprintf(os.Stderr, "no bytes read at %d: %s", p, err)
+			return 0
+		}
+
 		// check if read char is new line
-		s := string(b)
+		s := string(buf)
 		if s == "\n" {
 			l++
 			// if line count is passed
