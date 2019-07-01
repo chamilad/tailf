@@ -14,11 +14,11 @@ import (
 )
 
 const (
-	DEBUG_MODE = true
+	DEBUG_MODE = false
 )
 
 // usage: tailf <initial line count> <filename>
-// TODO: defers are not run during sigint
+// TODO: defers are not run during sigint, need to trap signals
 // TODO: parse flags better, consider various permutations of order of flags
 // TODO: manage filename flag
 // TODO: -h flag - show usage
@@ -101,6 +101,7 @@ func main() {
 	// not interested in other events
 	cwd := wd
 
+ConLoop:
 	for {
 		select {
 		case event := <-events:
@@ -190,20 +191,23 @@ func main() {
 					_, err := os.Stat(fname)
 					if err != nil {
 						debug("FILE DELETED, TIME TO DIE")
-						os.Exit(0)
+						// let defers be executed. os.Exit() would not allow that
+						break ConLoop
+						// todo: a shutdown event should be sent to
+						//  the producer loop
 					}
 				case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
 					debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
 
 					// file was deleted, exit
 					_ = f.Close()
-					os.Exit(0)
+					// let defers be executed. os.Exit() would not allow that
+					break ConLoop
 				}
 			}
 		}
 	}
 }
-
 
 // printContent writes the given string to stdout
 func printContent(s string) {
@@ -253,6 +257,8 @@ func watchFile(fd int, fname string) uint32 {
 func handleErrorAndExit(e error, msg string) {
 	if e != nil {
 		printErr(fmt.Sprintf("%s: %s\n", msg, e))
+		// todo: defers are not run after this, need to close resources
+		//  properly. maybe send signals instead of this?
 		os.Exit(1)
 	}
 }
