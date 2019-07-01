@@ -14,7 +14,13 @@ import (
 )
 
 const (
-	DEBUG_MODE = true
+	DEBUG_MODE = false
+)
+
+var (
+	// list of funcs to run when shutting down
+	// typically are resource closing tasks
+	defers []func()
 )
 
 // usage: tailf <initial line count> <filename>
@@ -29,6 +35,9 @@ const (
 // TODO: tail multiple files in a dir matching a pattern
 // TODO: maintain all fds and wds in an internal structure and defer to close all
 func main() {
+	// schedule defer func for shutdown
+	defer runDeferFuncs()
+
 	// args without bin name
 	if len(os.Args) == 1 {
 		printErr("no file specified to tail")
@@ -54,9 +63,14 @@ func main() {
 
 	// check if file exists
 	f, err := os.Open(fname)
-	// close the handler later
-	defer f.Close()
 	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
+
+	// close the handler later
+	addDeferFunc(func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	})
 
 	debug("creating inotify event")
 	// TODO: apparently syscall is deprecated, use sys pkg later
@@ -72,9 +86,9 @@ func main() {
 	// todo: handle errors in showLastLines()
 	// cursor is at EOF-1
 
-	defer func() {
+	addDeferFunc(func() {
 		removeWatch(fd, wd)
-	}()
+	})
 
 	// this channel communicates the events
 	events := make(chan uint32)
@@ -88,9 +102,13 @@ func main() {
 		case event := <-events:
 			switch event {
 			case syscall.IN_MOVE_SELF:
-				// file moved, close current file handler and open a new one
+				// file moved, close current file handler and
+				// open a new one
 				debug("FILE MOVED")
-				f.Close()
+
+				// close the file now to avoid accumulating open
+				// file handlers
+				_ = f.Close()
 
 				// wait for new file to appear
 				for {
@@ -109,6 +127,13 @@ func main() {
 				f, err = os.Open(fname)
 				handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
 
+				// close the handler later
+				addDeferFunc(func() {
+					if f != nil {
+						_ = f.Close()
+					}
+				})
+
 				// remove existing inotify watch and add a new watch for the new file handler
 				removeWatch(fd, wd)
 				wd = watchFile(fd, fname)
@@ -125,30 +150,43 @@ func main() {
 				} else if finfo.Size() < lastFSize {
 					debug("FILE TRUNCATED")
 
-					// file has been truncated
-					f.Seek(0, io.SeekStart)
+					// file has been truncated, go to the beginning
+					_, _ = f.Seek(0, io.SeekStart)
 					lastFSize = showFileContent(f)
 				}
 			case syscall.IN_DELETE_SELF, syscall.IN_ATTRIB, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
 				// in ubuntu, rm sends an IN_ATTRIB possibly because of unlink()
 				debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
 
-				// file was deleted, exit?
-				f.Close()
+				// file was deleted, exit
+				_ = f.Close()
 				os.Exit(0)
 			}
 		}
 	}
 }
 
+// addDeferFunc queues a function to be run during shutdown
+func addDeferFunc(f func()) {
+	defers = append(defers, f)
+}
+
+// runDeferFuncs runs all the functions queued for execution during
+// shutdown
+func runDeferFuncs() {
+	for _, f := range defers {
+		f()
+	}
+}
+
 // printContent writes the given string to stdout
-func printContent(s string){
+func printContent(s string) {
 	_, _ = fmt.Fprint(os.Stdout, s)
 }
 
 // printErr prints the given message to stderr
 func printErr(s string) {
-	_, _ = fmt.Fprint(os.Stderr, s)
+	_, _ = fmt.Fprintf(os.Stderr, "%s\n", s)
 }
 
 // debug prints the given message to stderr only if the DEBUG_MODE is
@@ -210,7 +248,7 @@ func checkInotifyEvents(fd int, events chan<- uint32) {
 
 		// check if the read value is 0
 		if n <= 0 {
-			printErr( "inotify read resulted in EOF")
+			printErr("inotify read resulted in EOF")
 		}
 
 		// read the buffer for all its events
