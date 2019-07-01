@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +11,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+)
+
+const (
+	DEBUG_MODE = true
 )
 
 // usage: tailf <initial line count> <filename>
@@ -28,9 +31,10 @@ import (
 func main() {
 	// args without bin name
 	if len(os.Args) == 1 {
-		_, _ = fmt.Fprint(os.Stderr, "no file specified to tail")
+		printErr("no file specified to tail")
 		os.Exit(1)
 	}
+
 	args := os.Args[1:]
 
 	var fname string
@@ -54,27 +58,18 @@ func main() {
 	defer f.Close()
 	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
 
-	//log.Println("creating inotify event")
+	debug("creating inotify event")
 	// TODO: apparently syscall is deprecated, use sys pkg later
 	fd, err := syscall.InotifyInit()
 	handleErrorAndExit(err, fmt.Sprintf("error while registering inotify: %s", fname))
 
 	wd := watchFile(fd, fname)
-	//fmt.Printf("wd1: %d", wd)
-
-	//log.Println("seeks")
-	//n1, err:= f.Seek(0, io.SeekStart)
-	//n2, err := f.Seek(0, io.SeekEnd)
-	//n3, err := f.Seek(0, io.SeekCurrent)
-	//
-	//fmt.Printf("start: %d, end: %d, current: %d", n1, n2, n3)
-	//os.Exit(0)
 
 	// if a line count is provided, rewind cursor
 	// the file should be read from the end, backwards
-	// TODO: handle f == nil
-	//log.Println("tailing last lines")
+	debug("tailing last lines")
 	lastFSize := showLastLines(lcount, f)
+	// todo: handle errors in showLastLines()
 	// cursor is at EOF-1
 
 	defer func() {
@@ -84,6 +79,7 @@ func main() {
 	// this channel communicates the events
 	events := make(chan uint32)
 
+	// start producer loop
 	go checkInotifyEvents(fd, events)
 
 	for {
@@ -93,7 +89,7 @@ func main() {
 			switch event {
 			case syscall.IN_MOVE_SELF:
 				// file moved, close current file handler and open a new one
-				//log.Println("FILE MOVED")
+				debug("FILE MOVED")
 				f.Close()
 
 				// wait for new file to appear
@@ -103,7 +99,7 @@ func main() {
 						break
 					}
 
-					//log.Println("file not yet appeared")
+					debug("file not yet appeared")
 
 					// todo exponential backoff, give up after a certain time
 					time.Sleep(2 * time.Second)
@@ -111,29 +107,32 @@ func main() {
 
 				// file appeared, open a new file handler
 				f, err = os.Open(fname)
-				handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
+				handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
 
 				// remove existing inotify watch and add a new watch for the new file handler
 				removeWatch(fd, wd)
 				wd = watchFile(fd, fname)
-				//fmt.Printf("wd2: %d", wd)
 			case syscall.IN_MODIFY:
 				// file was written to or truncated, need to determine what happend
 				finfo, err := os.Stat(f.Name())
 				handleErrorAndExit(err, "error while sizing file during modify event")
+
 				if finfo.Size() > lastFSize {
-					//log.Println("FILE WRITTEN")
+					debug("FILE WRITTEN")
+
 					// file has been written into, ie "write()"
 					lastFSize = showFileContent(f)
 				} else if finfo.Size() < lastFSize {
-					//log.Println("FILE TRUNCATED")
+					debug("FILE TRUNCATED")
+
 					// file has been truncated
 					f.Seek(0, io.SeekStart)
 					lastFSize = showFileContent(f)
 				}
 			case syscall.IN_DELETE_SELF, syscall.IN_ATTRIB, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
 				// in ubuntu, rm sends an IN_ATTRIB possibly because of unlink()
-				//log.Println("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
+				debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
+
 				// file was deleted, exit?
 				f.Close()
 				os.Exit(0)
@@ -142,31 +141,52 @@ func main() {
 	}
 }
 
+// printContent writes the given string to stdout
+func printContent(s string){
+	_, _ = fmt.Fprint(os.Stdout, s)
+}
+
+// printErr prints the given message to stderr
+func printErr(s string) {
+	_, _ = fmt.Fprint(os.Stderr, s)
+}
+
+// debug prints the given message to stderr only if the DEBUG_MODE is
+// true
+func debug(s string) {
+	if DEBUG_MODE {
+		printErr(s)
+	}
+}
+
 // removeWatch stops watching a file by removing a given watch
 // descriptor from the given inotify file descriptor
-func removeWatch(fd int, wd int) (int, error) {
-	return syscall.InotifyRmWatch(fd, uint32(wd))
+func removeWatch(fd int, wd uint32) (int, error) {
+	return syscall.InotifyRmWatch(fd, wd)
 }
 
 // watchFile adds a new inotify watch for a given file at the given
 // inotify file descriptor.
 // Returns the created watch descriptor
-func watchFile(fd int, fname string) int {
-	//log.Println("adding watch")
+func watchFile(fd int, fname string) uint32 {
+	debug("adding watch")
 	wd, err := syscall.InotifyAddWatch(
 		fd,
 		fname,
-		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
+		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|
+			syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
 	//syscall.IN_ALL_EVENTS)
 	handleErrorAndExit(err, fmt.Sprintf("error while adding an inotify watch: %s", fname))
-	return wd
+
+	debug(fmt.Sprintf("wd for watched file: %d", wd))
+	return uint32(wd)
 }
 
 // handleErrorAndExit will exit with 1 if there is an error
 // todo: crude
 func handleErrorAndExit(e error, msg string) {
 	if e != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "%s: %s\n", msg, e)
+		printErr(fmt.Sprintf("%s: %s\n", msg, e))
 		os.Exit(1)
 	}
 }
@@ -181,21 +201,23 @@ func handleErrorAndExit(e error, msg string) {
 func checkInotifyEvents(fd int, events chan<- uint32) {
 	for {
 		buf := make([]byte, (syscall.SizeofInotifyEvent+syscall.NAME_MAX+1)*10)
+
 		// read from the opened inotify file descriptor, into buf
-		//log.Println("reading inotify event list")
-		// read is blocking until len(buf) is available
+		// read() is blocking until some data is available
+		debug("reading inotify event list")
 		n, err := syscall.Read(fd, buf)
 		handleErrorAndExit(err, "error while reading inotify file")
 
 		// check if the read value is 0
 		if n <= 0 {
-			handleErrorAndExit(errors.New(""), "inotify read resulted in EOF")
+			printErr( "inotify read resulted in EOF")
 		}
 
 		// read the buffer for all its events
 		offset := 0
 		for {
 			if offset+syscall.SizeofInotifyEvent > n {
+				debug("reached end of inotify buffer")
 				break
 			}
 
@@ -225,13 +247,14 @@ func showLastLines(lc int, f *os.File) int64 {
 
 	finfo, err := os.Stat(f.Name())
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "error while getting fileinfo: %s", f.Name())
+		printErr(fmt.Sprintf("error while getting fileinfo: %s", f.Name()))
 		return 0
 	}
 
 	fsize := finfo.Size()
 
-	if fsize == -0 {
+	if fsize == 0 {
+		debug("file has no content to show")
 		return 0
 	}
 
@@ -246,7 +269,7 @@ func showLastLines(lc int, f *os.File) int64 {
 		// seek backwards by offset from the end
 		p, err := f.Seek(int64(offset), io.SeekEnd)
 		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "error while seeking by char at %d: %s", offset, err)
+			printErr(fmt.Sprintf("error while seeking by char at %d: %s", offset, err))
 			return 0
 		}
 
@@ -254,12 +277,12 @@ func showLastLines(lc int, f *os.File) int64 {
 		buf := make([]byte, 1)
 		n, err := f.Read(buf)
 		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "error while reading char at %d: %s", p, err)
+			printErr(fmt.Sprintf("error while reading char at %d: %s", p, err))
 			return 0
 		}
 
 		if n <= 0 {
-			_, _ = fmt.Fprintf(os.Stderr, "no bytes read at %d: %s", p, err)
+			printErr(fmt.Sprintf("no bytes read at %d: %s", p, err))
 			return 0
 		}
 
@@ -282,7 +305,7 @@ func showLastLines(lc int, f *os.File) int64 {
 	// seek to the found position
 	_, err = f.Seek(int64(offset), io.SeekEnd)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "end: error while seeking by char at %d: %s", offset, err)
+		printErr(fmt.Sprintf("end: error while seeking by char at %d: %s", offset, err))
 		return 0
 	}
 
@@ -290,27 +313,31 @@ func showLastLines(lc int, f *os.File) int64 {
 	return showFileContent(f)
 }
 
+// showFileContent reads the given file from the current cursor
+// position to the end of file and outputs to stdout.
+// Returns the file size after reading
 func showFileContent(f *os.File) int64 {
 	// get current position
-	c, err := f.Seek(0, io.SeekCurrent)
+	curPos, err := f.Seek(0, io.SeekCurrent)
 	handleErrorAndExit(err, "error while getting current cursor pos")
 
 	finfo, err := os.Stat(f.Name())
 	handleErrorAndExit(err, "error while getting filesize")
 
 	// len to read is total file size - current position
-	buflen := finfo.Size() - c
+	fsize := finfo.Size()
+	buflen := fsize - curPos
 
 	buf := make([]byte, buflen)
 	n, err := f.Read(buf)
 	handleErrorAndExit(err, "couldn't read line count")
 	if n <= 0 {
-		fmt.Println("reading file returned 0 or less bytes")
+		printErr("reading file returned 0 or less bytes")
 	}
 
-	_, _ = fmt.Fprint(os.Stdout, string(buf[:n]))
+	printContent(string(buf[:n]))
 
-	return finfo.Size()
+	return fsize
 }
 
 // extractLineCount parses the given string to a usable int value
