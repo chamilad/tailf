@@ -14,16 +14,11 @@ import (
 )
 
 const (
-	DEBUG_MODE = false
-)
-
-var (
-	// list of funcs to run when shutting down
-	// typically are resource closing tasks
-	defers []func()
+	DEBUG_MODE = true
 )
 
 // usage: tailf <initial line count> <filename>
+// TODO: defers are not run during sigint
 // TODO: parse flags better, consider various permutations of order of flags
 // TODO: manage filename flag
 // TODO: -h flag - show usage
@@ -35,8 +30,8 @@ var (
 // TODO: tail multiple files in a dir matching a pattern
 // TODO: maintain all fds and wds in an internal structure and defer to close all
 func main() {
-	// schedule defer func for shutdown
-	defer runDeferFuncs()
+	// watch descriptors to be closed
+	var wds []uint32
 
 	// args without bin name
 	if len(os.Args) == 1 {
@@ -66,18 +61,21 @@ func main() {
 	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
 
 	// close the handler later
-	addDeferFunc(func() {
+	defer func(f *os.File) {
+		debug("defer 1")
 		if f != nil {
 			_ = f.Close()
 		}
-	})
+	}(f)
 
 	debug("creating inotify event")
 	// TODO: apparently syscall is deprecated, use sys pkg later
+	// TODO: check if fd opened below needs to be closed
 	fd, err := syscall.InotifyInit()
 	handleErrorAndExit(err, fmt.Sprintf("error while registering inotify: %s", fname))
 
 	wd := watchFile(fd, fname)
+	wds = append(wds, wd)
 
 	// if a line count is provided, rewind cursor
 	// the file should be read from the end, backwards
@@ -86,98 +84,126 @@ func main() {
 	// todo: handle errors in showLastLines()
 	// cursor is at EOF-1
 
-	addDeferFunc(func() {
-		removeWatch(fd, wd)
-	})
+	defer func(wds []uint32, fd int) {
+		debug("defer 2")
+		for _, wd := range wds {
+			_, _ = removeWatch(fd, wd)
+		}
+	}(wds, fd)
 
 	// this channel communicates the events
-	events := make(chan uint32)
+	events := make(chan syscall.InotifyEvent)
 
 	// start producer loop
 	go checkInotifyEvents(fd, events)
 
+	// the wd currently watching events for
+	// not interested in other events
+	cwd := wd
+
 	for {
 		select {
-		// todo: need to verify if event is for currently watching file handler by comparing wd
 		case event := <-events:
-			switch event {
-			case syscall.IN_MOVE_SELF:
-				// file moved, close current file handler and
-				// open a new one
-				debug("FILE MOVED")
+			// is this an event for the file we are currently
+			// interested in?
+			if uint32(event.Wd) == cwd {
+				switch event.Mask {
+				case syscall.IN_MOVE_SELF:
+					// file moved, close current file handler and
+					// open a new one
+					debug("FILE MOVED")
 
-				// close the file now to avoid accumulating open
-				// file handlers
-				_ = f.Close()
+					// close the file now to avoid accumulating open
+					// file handlers
+					_ = f.Close()
 
-				// wait for new file to appear
-				for {
+					// wait for new file to appear
+					for {
+						_, err := os.Stat(fname)
+						if err == nil {
+							break
+						}
+
+						debug("file not yet appeared")
+
+						// todo exponential backoff, give up after a certain time
+						// there is a window to miss some events,
+						// during timeout if the file is created and
+						// written to, we miss those events
+						// those possible writes are covered by the
+						// showFileContent() done later after creating
+						// a new wd
+						time.Sleep(2 * time.Second)
+					}
+
+					// file appeared, open a new file handler
+					f, err = os.Open(fname)
+					handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
+
+					// close the handler later
+					// can't close early within loop because next
+					// iterations need this ref survived to show
+					// content
+					defer func(f *os.File) {
+						debug("defer 3")
+						if f != nil {
+							_ = f.Close()
+						}
+					}(f)
+
+					// add a new watch
+					nwd := watchFile(fd, fname)
+					// mark it to be closed during shutdown
+					wds = append(wds, nwd)
+					// set current wd to the new wd
+					cwd = nwd
+
+					// show any content created during the timeout
+					// also reset last read file size
+					lastFSize = showFileContent(f)
+
+					// remove existing inotify watch
+					_, _ = removeWatch(fd, wd)
+				case syscall.IN_MODIFY:
+					// file was written to or truncated, need to determine what happened
+					finfo, err := os.Stat(f.Name())
+					handleErrorAndExit(err, "error while sizing file during modify event")
+
+					if finfo.Size() > lastFSize {
+						debug("FILE WRITTEN")
+
+						// file has been written into, ie "write()"
+						lastFSize = showFileContent(f)
+					} else if finfo.Size() < lastFSize {
+						debug("FILE TRUNCATED")
+
+						// file has been truncated, go to the beginning
+						_, _ = f.Seek(0, io.SeekStart)
+						lastFSize = showFileContent(f)
+					}
+				case syscall.IN_ATTRIB:
+					debug(fmt.Sprintf("ATTRIB received: %d", event.Wd))
+
+					// rm sends an IN_ATTRIB possibly because of unlink()
+					// check if file deleted and not any other
+					// IN_ATTRIB source
 					_, err := os.Stat(fname)
-					if err == nil {
-						break
+					if err != nil {
+						debug("FILE DELETED, TIME TO DIE")
+						os.Exit(0)
 					}
+				case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
+					debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
 
-					debug("file not yet appeared")
-
-					// todo exponential backoff, give up after a certain time
-					time.Sleep(2 * time.Second)
+					// file was deleted, exit
+					_ = f.Close()
+					os.Exit(0)
 				}
-
-				// file appeared, open a new file handler
-				f, err = os.Open(fname)
-				handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
-
-				// close the handler later
-				addDeferFunc(func() {
-					if f != nil {
-						_ = f.Close()
-					}
-				})
-
-				// remove existing inotify watch and add a new watch for the new file handler
-				removeWatch(fd, wd)
-				wd = watchFile(fd, fname)
-			case syscall.IN_MODIFY:
-				// file was written to or truncated, need to determine what happend
-				finfo, err := os.Stat(f.Name())
-				handleErrorAndExit(err, "error while sizing file during modify event")
-
-				if finfo.Size() > lastFSize {
-					debug("FILE WRITTEN")
-
-					// file has been written into, ie "write()"
-					lastFSize = showFileContent(f)
-				} else if finfo.Size() < lastFSize {
-					debug("FILE TRUNCATED")
-
-					// file has been truncated, go to the beginning
-					_, _ = f.Seek(0, io.SeekStart)
-					lastFSize = showFileContent(f)
-				}
-			case syscall.IN_DELETE_SELF, syscall.IN_ATTRIB, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
-				// in ubuntu, rm sends an IN_ATTRIB possibly because of unlink()
-				debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
-
-				// file was deleted, exit
-				_ = f.Close()
-				os.Exit(0)
 			}
 		}
 	}
 }
 
-// addDeferFunc queues a function to be run during shutdown
-func addDeferFunc(f func()) {
-	defers = append(defers, f)
-}
-
-// runDeferFuncs runs all the functions queued for execution during
-// shutdown
-func runDeferFuncs() {
-	for _, f := range defers {
-		f()
-	}
-}
 
 // printContent writes the given string to stdout
 func printContent(s string) {
@@ -200,6 +226,7 @@ func debug(s string) {
 // removeWatch stops watching a file by removing a given watch
 // descriptor from the given inotify file descriptor
 func removeWatch(fd int, wd uint32) (int, error) {
+	debug(fmt.Sprintf("removing watch: %d", wd))
 	return syscall.InotifyRmWatch(fd, wd)
 }
 
@@ -216,8 +243,9 @@ func watchFile(fd int, fname string) uint32 {
 	//syscall.IN_ALL_EVENTS)
 	handleErrorAndExit(err, fmt.Sprintf("error while adding an inotify watch: %s", fname))
 
-	debug(fmt.Sprintf("wd for watched file: %d", wd))
-	return uint32(wd)
+	uwd := uint32(wd)
+	debug(fmt.Sprintf("wd for watched file: %d", uwd))
+	return uwd
 }
 
 // handleErrorAndExit will exit with 1 if there is an error
@@ -236,7 +264,7 @@ func handleErrorAndExit(e error, msg string) {
 // At the moment, the read() call could close improperly if the main
 // thread gives out. Need a way to timeout based on a notification
 // from the main thread.
-func checkInotifyEvents(fd int, events chan<- uint32) {
+func checkInotifyEvents(fd int, events chan<- syscall.InotifyEvent) {
 	for {
 		buf := make([]byte, (syscall.SizeofInotifyEvent+syscall.NAME_MAX+1)*10)
 
@@ -264,9 +292,11 @@ func checkInotifyEvents(fd int, events chan<- uint32) {
 			err = binary.Read(bytes.NewReader(buf[offset:(offset+syscall.SizeofInotifyEvent+1)]), binary.LittleEndian, &event)
 			handleErrorAndExit(err, "error while reading inotify events from the buf")
 
+			debug(fmt.Sprintf("read inotify event for wd %d", event.Wd))
+
 			// notify the waiting consumer of the event
 			// TODO buffer and gather all modify events to one to avoid spamming the consumer thread
-			events <- event.Mask
+			events <- event
 
 			// move the window and read the next event
 			offset += syscall.SizeofInotifyEvent + int(event.Len)
