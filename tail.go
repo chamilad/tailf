@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,18 +31,14 @@ const (
 
 // TODO: parse flags better, consider various permutations of order of flags
 // TODO: manage filename flag
-// TODO: -h flag - show usage
 // TODO: manpage maybe?
-// TODO: --version flag
 // TODO: instrument and perf test
 // TODO: manage error messages
 // TODO: checkout magefile as a build system
 // TODO: tail multiple files in a dir matching a pattern
 // TODO: maintain all fds and wds in an internal structure and defer to close all
 func main() {
-	// watch descriptors to be closed
-	var wds []uint32
-
+	debug("registering signal trap")
 	// channels to trap signals
 	sigs := make(chan os.Signal, 1)
 	// channel to ping workers to shutdown when a signal is received
@@ -57,9 +54,10 @@ func main() {
 		done <- true
 	}()
 
-	// start processing input
+	debug("processing input")
+	// watch descriptors to be closed
+	var wds []uint32
 
-	var fname string
 	var lcount int
 
 	// args without bin name
@@ -69,6 +67,8 @@ func main() {
 	}
 
 	args := os.Args[1:]
+
+	files := make([]string, 0)
 
 	// parse arguments
 	for _, arg := range args {
@@ -94,15 +94,25 @@ func main() {
 		} else {
 			// should be either a single file name, multiple filenames or a file pattern
 			// todo: considering only single file scenario for now
+			// shadowing, so using f to temp store string value
 			f, err := parseFileName(arg)
 			if err != nil {
 				printErr(fmt.Sprintf("file not found: %s", arg))
 				showUsageAndExit()
 			}
 
-			fname = f
+			files = append(files, f)
+
+			//fname = f
 		}
 	}
+
+	// if there are no files to tail, exit
+	if len(files) == 0 {
+		handleErrorAndExit(errors.New("no files provided to tail"), "")
+	}
+
+	debug(fmt.Sprintf("%d files to tail", len(files)))
 
 	// if not tail count is provided, set default tail count to 5,
 	// awkward otherwise
@@ -110,34 +120,13 @@ func main() {
 		lcount = 5
 	}
 
-	// create file handler for file
-	f, err := os.Open(fname)
-	handleErrorAndExit(err, fmt.Sprintf("error while opening file: %s", fname))
-
-	// close the handler later
-	defer func(f *os.File) {
-		debug("defer 1: file closing")
-		if f != nil {
-			_ = f.Close()
-		}
-	}(f)
-
 	debug("creating inotify event")
 	// TODO: apparently syscall is deprecated, use sys pkg later
 	// TODO: check if fd opened below needs to be closed
 	fd, err := syscall.InotifyInit()
-	handleErrorAndExit(err, fmt.Sprintf("error while registering inotify: %s", fname))
+	handleErrorAndExit(err, "error while inotify init")
 
-	wd := watchFile(fd, fname)
-	wds = append(wds, wd)
-
-	// if a line count is provided, rewind cursor
-	// the file should be read from the end, backwards
-	debug("tailing last lines")
-	lastFSize := showLastLines(lcount, f)
-	// todo: handle errors in showLastLines()
-	// cursor is at EOF-1
-
+	// schedule open wds to be closed during shutdown
 	defer func(wds []uint32, fd int) {
 		debug("defer 2: wd closings")
 		for _, wd := range wds {
@@ -148,126 +137,171 @@ func main() {
 	// this channel communicates the events
 	events := make(chan syscall.InotifyEvent)
 
-	// start producer loop
-	go checkInotifyEvents(fd, events)
+	// for each filename given,
+	// 1. register an inotify watch
+	// 2. spawn an inotify event watcher
+	// 3. spawn an event consumer
+	// todo: decide color for each file
+	// todo: prefix filename if multiple files
+	for _, fname := range files {
+		debug(fmt.Sprintf("registering tailer for %s", fname))
+		// create file handler for file
+		f, err := os.Open(fname)
+		handleErrorAndExit(err, fmt.Sprintf("error while opening file: %s", fname))
 
-	// the wd currently watching events for
-	// not interested in other events
-	cwd := wd
+		// close the handler later
+		defer func(f *os.File) {
+			debug("defer 1: file closing")
+			if f != nil {
+				_ = f.Close()
+			}
+		}(f)
 
-ConLoop:
-	for {
-		select {
-		case <-done:
-			debug("received notice to shutdown")
-			break ConLoop
-		case event := <-events:
-			// is this an event for the file we are currently
-			// interested in?
-			if uint32(event.Wd) == cwd {
-				switch event.Mask {
-				case syscall.IN_MOVE_SELF:
-					// file moved, close current file handler and
-					// open a new one
-					debug("FILE MOVED")
+		wd := watchFile(fd, fname)
+		wds = append(wds, wd)
 
-					// close the file now to avoid accumulating open
-					// file handlers
-					_ = f.Close()
+		// if a line count is provided, rewind cursor
+		// the file should be read from the end, backwards
+		debug("tailing last lines")
+		lastFSize := showLastLines(lcount, f)
+		// todo: handle errors in showLastLines()
+		// cursor is at EOF-1
 
-					// wait for new file to appear
-					for {
-						_, err := os.Stat(fname)
-						if err == nil {
-							break
-						}
+		// start producer loop
+		go checkInotifyEvents(fd, events)
 
-						debug("file not yet appeared")
+		// start consumer loop
+		go func(cwd uint32) {
+			// the cwd currently watching events for
+			// not interested in other events
 
-						// todo exponential backoff, give up after a certain time
-						// there is a window to miss some events,
-						// during timeout if the file is created and
-						// written to, we miss those events
-						// those possible writes are covered by the
-						// showFileContent() done later after creating
-						// a new wd
-						time.Sleep(2 * time.Second)
-					}
-
-					// file appeared, open a new file handler
-					f, err = os.Open(fname)
-					handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
-
-					// close the handler later
-					// can't close early within loop because next
-					// iterations need this ref survived to show
-					// content
-					defer func(f *os.File) {
-						debug("defer 3: new file closing")
-						if f != nil {
-							_ = f.Close()
-						}
-					}(f)
-
-					// add a new watch
-					nwd := watchFile(fd, fname)
-					// mark it to be closed during shutdown
-					wds = append(wds, nwd)
-					// set current wd to the new wd
-					cwd = nwd
-
-					// show any content created during the timeout
-					// also reset last read file size
-					lastFSize = showFileContent(f)
-
-					// remove existing inotify watch
-					_, _ = removeWatch(fd, wd)
-				case syscall.IN_MODIFY:
-					// file was written to or truncated, need to determine what happened
-					finfo, err := os.Stat(f.Name())
-					handleErrorAndExit(err, "error while sizing file during modify event")
-
-					if finfo.Size() > lastFSize {
-						debug("FILE WRITTEN")
-
-						// file has been written into, ie "write()"
-						lastFSize = showFileContent(f)
-					} else if finfo.Size() < lastFSize {
-						debug("FILE TRUNCATED")
-
-						// file has been truncated, go to the beginning
-						_, _ = f.Seek(0, io.SeekStart)
-						lastFSize = showFileContent(f)
-					}
-				case syscall.IN_ATTRIB:
-					debug(fmt.Sprintf("ATTRIB received: %d", event.Wd))
-
-					// rm sends an IN_ATTRIB possibly because of unlink()
-					// check if file deleted and not any other
-					// IN_ATTRIB source
-					_, err := os.Stat(fname)
-					if err != nil {
-						debug("FILE DELETED, TIME TO DIE")
-						// let defers be executed. os.Exit() would not allow that
-						break ConLoop
-					}
-				case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
-					debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
-
-					// file was deleted, exit
-					_ = f.Close()
-					// let defers be executed. os.Exit() would not allow that
+		ConLoop:
+			for {
+				select {
+				case <-done:
+					debug("received notice to shutdown")
 					break ConLoop
+				case event := <-events:
+					// is this an event for the file we are currently
+					// interested in?
+					if uint32(event.Wd) == cwd {
+						switch event.Mask {
+						case syscall.IN_MOVE_SELF:
+							// file moved, close current file handler and
+							// open a new one
+							debug("FILE MOVED")
+
+							// close the file now to avoid accumulating open
+							// file handlers
+							_ = f.Close()
+
+							// wait for new file to appear
+							for {
+								_, err := os.Stat(fname)
+								if err == nil {
+									break
+								}
+
+								debug("file not yet appeared")
+
+								// todo exponential backoff, give up after a certain time
+								// there is a window to miss some events,
+								// during timeout if the file is created and
+								// written to, we miss those events
+								// those possible writes are covered by the
+								// showFileContent() done later after creating
+								// a new wd
+								time.Sleep(2 * time.Second)
+							}
+
+							// file appeared, open a new file handler
+							f, err = os.Open(fname)
+							handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
+
+							// close the handler later
+							// can't close early within loop because next
+							// iterations need this ref survived to show
+							// content
+							defer func(f *os.File) {
+								debug("defer 3: new file closing")
+								if f != nil {
+									_ = f.Close()
+								}
+							}(f)
+
+							// add a new watch
+							nwd := watchFile(fd, fname)
+							// mark it to be closed during shutdown
+							wds = append(wds, nwd)
+							// set current wd to the new wd
+							cwd = nwd
+
+							// show any content created during the timeout
+							// also reset last read file size
+							lastFSize = showFileContent(f)
+
+							// remove existing inotify watch
+							_, _ = removeWatch(fd, wd)
+						case syscall.IN_MODIFY:
+							// file was written to or truncated, need to determine what happened
+							finfo, err := os.Stat(f.Name())
+							handleErrorAndExit(err, "error while sizing file during modify event")
+
+							if finfo.Size() > lastFSize {
+								debug("FILE WRITTEN")
+
+								// file has been written into, ie "write()"
+								lastFSize = showFileContent(f)
+							} else if finfo.Size() < lastFSize {
+								debug("FILE TRUNCATED")
+
+								// file has been truncated, go to the beginning
+								_, _ = f.Seek(0, io.SeekStart)
+								lastFSize = showFileContent(f)
+							}
+						case syscall.IN_ATTRIB:
+							debug(fmt.Sprintf("ATTRIB received: %d", event.Wd))
+
+							// rm sends an IN_ATTRIB possibly because of unlink()
+							// check if file deleted and not any other
+							// IN_ATTRIB source
+							_, err := os.Stat(fname)
+							if err != nil {
+								debug("FILE DELETED, TIME TO DIE")
+								// let defers be executed. os.Exit() would not allow that
+								break ConLoop
+							}
+						case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
+							debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
+
+							// file was deleted, exit
+							_ = f.Close()
+							// let defers be executed. os.Exit() would not allow that
+							break ConLoop
+						}
+					}
 				}
 			}
-		}
+		}(wd)
 	}
+
+	// holding the main thread until shutdown
+	<-done
+	debug("received notice to shutdown")
 }
 
 // parseFileName accepts a string argument and checks to see if the
 // file with the absolute path exists or not
 // Returns the absoulte filename and an error if the file doesn't exist
 func parseFileName(s string) (string, error) {
+	// todo: expand by wildcards,
+	//  ? - any single char
+	//  * - any multiple chars
+	//  [] - list or range of chars
+	//  {} - wildcard or exact name terms
+	//  [!] - not []
+	//  \ - escape
+	//  NOTE: not urgent, can work with tools like find and pipe
 	fname, err := filepath.Abs(s)
 	handleErrorAndExit(err, "error while converting filenames")
 
