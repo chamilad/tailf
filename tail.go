@@ -19,7 +19,15 @@ const (
 	DEBUG_MODE = false
 )
 
-// usage: tailf <initial line count> <filename>
+// usage: tailf <filename>
+//        tailf paths ...<file paths> // tail multiple files
+//        tailf paths ...<path/wildcard_pattern> // tail multiple files
+// 		  tailf <path>/<wildcard_pattern> // tail files that match
+// 	 	                                     this pattern
+//        tailf -<initial line count> <all above usages>
+//        tailf -h | --help
+//        tailf -v | --version
+
 // TODO: parse flags better, consider various permutations of order of flags
 // TODO: manage filename flag
 // TODO: -h flag - show usage
@@ -34,9 +42,13 @@ func main() {
 	// watch descriptors to be closed
 	var wds []uint32
 
+	// channels to trap signals
 	sigs := make(chan os.Signal, 1)
+	// channel to ping workers to shutdown when a signal is received
 	done := make(chan bool, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	// wait for signals async
 	go func() {
 		debug("waiting for signals")
 		<-sigs
@@ -44,6 +56,11 @@ func main() {
 
 		done <- true
 	}()
+
+	// start processing input
+
+	var fname string
+	var lcount int
 
 	// args without bin name
 	if len(os.Args) == 1 {
@@ -53,28 +70,53 @@ func main() {
 
 	args := os.Args[1:]
 
-	var fname string
-	var lcount int
+	// parse arguments
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			// one of init count, help, or version
 
-	// check if a line count is provided
-	if len(args) == 2 {
-		lcount = extractLineCount(args[0])
-		fname = args[1]
-	} else {
-		lcount = 0
-		fname = args[0]
+			// is it the help flag
+			if arg == "-h" || arg == "--help" {
+				showUsageAndExit()
+			}
+
+			// is it the version flag
+			if arg == "-v" || arg == "--version" {
+				showVersionAndExit()
+			}
+
+			// is it the line count flag
+			lc, err := extractLineCount(arg)
+			handleErrorAndExit(err, fmt.Sprintf("unknown flag: %s", arg))
+
+			// it is the line count flag
+			lcount = lc
+		} else {
+			// should be either a single file name, multiple filenames or a file pattern
+			// todo: considering only single file scenario for now
+			f, err := parseFileName(arg)
+			if err != nil {
+				printErr(fmt.Sprintf("file not found: %s", arg))
+				showUsageAndExit()
+			}
+
+			fname = f
+		}
 	}
 
-	fname, err := filepath.Abs(fname)
-	handleErrorAndExit(err, "error while converting filenames")
+	// if not tail count is provided, set default tail count to 5,
+	// awkward otherwise
+	if lcount == 0 {
+		lcount = 5
+	}
 
-	// check if file exists
+	// create file handler for file
 	f, err := os.Open(fname)
-	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
+	handleErrorAndExit(err, fmt.Sprintf("error while opening file: %s", fname))
 
 	// close the handler later
 	defer func(f *os.File) {
-		debug("defer 1")
+		debug("defer 1: file closing")
 		if f != nil {
 			_ = f.Close()
 		}
@@ -97,7 +139,7 @@ func main() {
 	// cursor is at EOF-1
 
 	defer func(wds []uint32, fd int) {
-		debug("defer 2")
+		debug("defer 2: wd closings")
 		for _, wd := range wds {
 			_, _ = removeWatch(fd, wd)
 		}
@@ -161,7 +203,7 @@ ConLoop:
 					// iterations need this ref survived to show
 					// content
 					defer func(f *os.File) {
-						debug("defer 3")
+						debug("defer 3: new file closing")
 						if f != nil {
 							_ = f.Close()
 						}
@@ -220,6 +262,32 @@ ConLoop:
 			}
 		}
 	}
+}
+
+// parseFileName accepts a string argument and checks to see if the
+// file with the absolute path exists or not
+// Returns the absoulte filename and an error if the file doesn't exist
+func parseFileName(s string) (string, error) {
+	fname, err := filepath.Abs(s)
+	handleErrorAndExit(err, "error while converting filenames")
+
+	// check if file exists
+	_, err = os.Stat(fname)
+	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
+
+	return fname, nil
+}
+
+// showVersionAndExit shows version details
+func showVersionAndExit() {
+	printErr("version details will appear in the future")
+	os.Exit(0)
+}
+
+// showUsageAndExit <- take a wild guess
+func showUsageAndExit() {
+	printErr("usage details will appear in the future")
+	os.Exit(0)
 }
 
 // printContent writes the given string to stdout
@@ -419,7 +487,7 @@ func showFileContent(f *os.File) int64 {
 	n, err := f.Read(buf)
 	handleErrorAndExit(err, "couldn't read line count")
 	if n <= 0 {
-		printErr("reading file returned 0 or less bytes")
+		debug("reading file returned 0 or less bytes")
 	}
 
 	printContent(string(buf[:n]))
@@ -429,13 +497,13 @@ func showFileContent(f *os.File) int64 {
 
 // extractLineCount parses the given string to a usable int value
 // It can tolerate - prefix
-func extractLineCount(s string) int {
+func extractLineCount(s string) (int, error) {
 	s = strings.TrimPrefix(s, "-")
 	s = strings.TrimSpace(s)
 
 	if i, err := strconv.ParseInt(s, 10, 0); err != nil {
-		return 0
+		return 0, err
 	} else {
-		return int(i)
+		return int(i), nil
 	}
 }
