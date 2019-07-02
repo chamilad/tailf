@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,11 +15,11 @@ import (
 )
 
 const (
+	// show debug information, for dev cycles
 	DEBUG_MODE = false
 )
 
 // usage: tailf <initial line count> <filename>
-// TODO: defers are not run during sigint, need to trap signals
 // TODO: parse flags better, consider various permutations of order of flags
 // TODO: manage filename flag
 // TODO: -h flag - show usage
@@ -32,6 +33,17 @@ const (
 func main() {
 	// watch descriptors to be closed
 	var wds []uint32
+
+	sigs := make(chan os.Signal, 1)
+	done := make(chan bool, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		debug("waiting for signals")
+		<-sigs
+		debug("signal received")
+
+		done <- true
+	}()
 
 	// args without bin name
 	if len(os.Args) == 1 {
@@ -104,6 +116,9 @@ func main() {
 ConLoop:
 	for {
 		select {
+		case <-done:
+			debug("received notice to shutdown")
+			break ConLoop
 		case event := <-events:
 			// is this an event for the file we are currently
 			// interested in?
@@ -193,8 +208,6 @@ ConLoop:
 						debug("FILE DELETED, TIME TO DIE")
 						// let defers be executed. os.Exit() would not allow that
 						break ConLoop
-						// todo: a shutdown event should be sent to
-						//  the producer loop
 					}
 				case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
 					debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
