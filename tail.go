@@ -29,14 +29,10 @@ const (
 //        tailf -h | --help
 //        tailf -v | --version
 
-// TODO: parse flags better, consider various permutations of order of flags
-// TODO: manage filename flag
 // TODO: manpage maybe?
 // TODO: instrument and perf test
 // TODO: manage error messages
 // TODO: checkout magefile as a build system
-// TODO: tail multiple files in a dir matching a pattern
-// TODO: maintain all fds and wds in an internal structure and defer to close all
 func main() {
 	debug("registering signal trap")
 	// channels to trap signals
@@ -58,6 +54,7 @@ func main() {
 	// watch descriptors to be closed
 	var wds []uint32
 
+	// line count to start with
 	var lcount int
 
 	// args without bin name
@@ -68,6 +65,7 @@ func main() {
 
 	args := os.Args[1:]
 
+	// list of files to tail
 	files := make([]string, 0)
 
 	// parse arguments
@@ -93,7 +91,6 @@ func main() {
 			lcount = lc
 		} else {
 			// should be either a single file name, multiple filenames or a file pattern
-			// todo: considering only single file scenario for now
 			// shadowing, so using f to temp store string value
 			f, err := parseFileName(arg)
 			if err != nil {
@@ -102,8 +99,6 @@ func main() {
 			}
 
 			files = append(files, f)
-
-			//fname = f
 		}
 	}
 
@@ -142,7 +137,6 @@ func main() {
 	// 2. spawn an inotify event watcher
 	// 3. spawn an event consumer
 	// todo: decide color for each file
-	// todo: prefix filename if multiple files
 	for _, fname := range files {
 		debug(fmt.Sprintf("registering tailer for %s", fname))
 		// create file handler for file
@@ -157,21 +151,28 @@ func main() {
 			}
 		}(f)
 
-		wd := watchFile(fd, fname)
+		wd := watchFile(fd, f.Name())
 		wds = append(wds, wd)
 
 		// if a line count is provided, rewind cursor
 		// the file should be read from the end, backwards
 		debug("tailing last lines")
-		lastFSize := showLastLines(lcount, f)
-		// todo: handle errors in showLastLines()
+		seekBackwardsByLineCount(lcount, f)
+		// read from the rewinded position to EOF
+		content, lastFSize := readContentToEOF(f)
 		// cursor is at EOF-1
+
+		if len(files) > 1 {
+			printContentWithFileName(f.Name(), content)
+		} else {
+			printContent(content)
+		}
 
 		// start producer loop
 		go checkInotifyEvents(fd, events)
 
 		// start consumer loop
-		go func(cwd uint32) {
+		go func(cwd uint32, lastFSize int64) {
 			// the cwd currently watching events for
 			// not interested in other events
 
@@ -197,7 +198,7 @@ func main() {
 
 							// wait for new file to appear
 							for {
-								_, err := os.Stat(fname)
+								_, err := os.Stat(f.Name())
 								if err == nil {
 									break
 								}
@@ -209,14 +210,14 @@ func main() {
 								// during timeout if the file is created and
 								// written to, we miss those events
 								// those possible writes are covered by the
-								// showFileContent() done later after creating
+								// readContentToEOF() done later after creating
 								// a new wd
-								time.Sleep(2 * time.Second)
+								time.Sleep(10 * time.Second)
 							}
 
 							// file appeared, open a new file handler
-							f, err = os.Open(fname)
-							handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", fname))
+							f, err = os.Open(f.Name())
+							handleErrorAndExit(err, fmt.Sprintf("error while opening new file: %s", f.Name()))
 
 							// close the handler later
 							// can't close early within loop because next
@@ -230,7 +231,7 @@ func main() {
 							}(f)
 
 							// add a new watch
-							nwd := watchFile(fd, fname)
+							nwd := watchFile(fd, f.Name())
 							// mark it to be closed during shutdown
 							wds = append(wds, nwd)
 							// set current wd to the new wd
@@ -238,7 +239,13 @@ func main() {
 
 							// show any content created during the timeout
 							// also reset last read file size
-							lastFSize = showFileContent(f)
+							content, rsize := readContentToEOF(f)
+							lastFSize = rsize
+							if len(files) > 1 {
+								printContentWithFileName(f.Name(), content)
+							} else {
+								printContent(content)
+							}
 
 							// remove existing inotify watch
 							_, _ = removeWatch(fd, wd)
@@ -251,13 +258,25 @@ func main() {
 								debug("FILE WRITTEN")
 
 								// file has been written into, ie "write()"
-								lastFSize = showFileContent(f)
+								content, rsize := readContentToEOF(f)
+								lastFSize = rsize
+								if len(files) > 1 {
+									printContentWithFileName(f.Name(), content)
+								} else {
+									printContent(content)
+								}
 							} else if finfo.Size() < lastFSize {
 								debug("FILE TRUNCATED")
 
 								// file has been truncated, go to the beginning
 								_, _ = f.Seek(0, io.SeekStart)
-								lastFSize = showFileContent(f)
+								content, rsize := readContentToEOF(f)
+								lastFSize = rsize
+								if len(files) > 1 {
+									printContentWithFileName(f.Name(), content)
+								} else {
+									printContent(content)
+								}
 							}
 						case syscall.IN_ATTRIB:
 							debug(fmt.Sprintf("ATTRIB received: %d", event.Wd))
@@ -265,7 +284,7 @@ func main() {
 							// rm sends an IN_ATTRIB possibly because of unlink()
 							// check if file deleted and not any other
 							// IN_ATTRIB source
-							_, err := os.Stat(fname)
+							_, err := os.Stat(f.Name())
 							if err != nil {
 								debug("FILE DELETED, TIME TO DIE")
 								// let defers be executed. os.Exit() would not allow that
@@ -282,7 +301,7 @@ func main() {
 					}
 				}
 			}
-		}(wd)
+		}(wd, lastFSize)
 	}
 
 	// holding the main thread until shutdown
@@ -301,9 +320,9 @@ func parseFileName(s string) (string, error) {
 	//  {} - wildcard or exact name terms
 	//  [!] - not []
 	//  \ - escape
-	//  NOTE: not urgent, can work with tools like find and pipe
+	//  NOTE: not urgent, can work with tools like find
 	fname, err := filepath.Abs(s)
-	handleErrorAndExit(err, "error while converting filenames")
+	handleErrorAndExit(err, "e	rror while converting filenames")
 
 	// check if file exists
 	_, err = os.Stat(fname)
@@ -327,6 +346,18 @@ func showUsageAndExit() {
 // printContent writes the given string to stdout
 func printContent(s string) {
 	_, _ = fmt.Fprint(os.Stdout, s)
+}
+
+// printContentWithFileName prints the given content to stdout,
+// prefixing each line with the base name of the given filename
+func printContentWithFileName(fname, content string) {
+	debug(fmt.Sprintf("printing line for %s", fname))
+	lines := strings.Split(strings.Trim(content, "\n"), "\n")
+	for _, l := range lines {
+		bfn := filepath.Base(fname)
+		bbfn := fmt.Sprintf("\x1b[1m%s => \x1b[0m", bfn)
+		printContent(fmt.Sprintf("%s %s\n", bbfn, l))
+	}
 }
 
 // printErr prints the given message to stderr
@@ -425,10 +456,10 @@ func checkInotifyEvents(fd int, events chan<- syscall.InotifyEvent) {
 	}
 }
 
-// showLastLines will move the read position of the passed
+// seekBackwardsByLineCount will move the read position of the passed
 // file until the specified line count from end is met
 // Returns the os.File reference which has a rewound cursor
-func showLastLines(lc int, f *os.File) int64 {
+func seekBackwardsByLineCount(lc int, f *os.File) {
 	// line count counter
 	l := 0
 	// offset counter, negative because counting backwards
@@ -437,14 +468,14 @@ func showLastLines(lc int, f *os.File) int64 {
 	finfo, err := os.Stat(f.Name())
 	if err != nil {
 		printErr(fmt.Sprintf("error while getting fileinfo: %s", f.Name()))
-		return 0
+		//return 0
 	}
 
 	fsize := finfo.Size()
 
 	if fsize == 0 {
 		debug("file has no content to show")
-		return 0
+		//return 0
 	}
 
 	// loop until lc is passed
@@ -459,7 +490,7 @@ func showLastLines(lc int, f *os.File) int64 {
 		p, err := f.Seek(int64(offset), io.SeekEnd)
 		if err != nil {
 			printErr(fmt.Sprintf("error while seeking by char at %d: %s", offset, err))
-			return 0
+			//return 0
 		}
 
 		// read one char, a new reader is needed from seeked File ref
@@ -467,12 +498,12 @@ func showLastLines(lc int, f *os.File) int64 {
 		n, err := f.Read(buf)
 		if err != nil {
 			printErr(fmt.Sprintf("error while reading char at %d: %s", p, err))
-			return 0
+			//return 0
 		}
 
 		if n <= 0 {
 			printErr(fmt.Sprintf("no bytes read at %d: %s", p, err))
-			return 0
+			//return 0
 		}
 
 		// check if read char is new line
@@ -495,17 +526,17 @@ func showLastLines(lc int, f *os.File) int64 {
 	_, err = f.Seek(int64(offset), io.SeekEnd)
 	if err != nil {
 		printErr(fmt.Sprintf("end: error while seeking by char at %d: %s", offset, err))
-		return 0
+		//return 0
 	}
 
 	// show the lines up to EOF
-	return showFileContent(f)
+	//return readContentToEOF(f)
 }
 
-// showFileContent reads the given file from the current cursor
-// position to the end of file and outputs to stdout.
-// Returns the file size after reading
-func showFileContent(f *os.File) int64 {
+// readContentToEOF reads the given file from the current cursor
+// position to the end of file.
+// Returns the read content and the file size at the time of read
+func readContentToEOF(f *os.File) (string, int64) {
 	// get current position
 	curPos, err := f.Seek(0, io.SeekCurrent)
 	handleErrorAndExit(err, "error while getting current cursor pos")
@@ -524,9 +555,9 @@ func showFileContent(f *os.File) int64 {
 		debug("reading file returned 0 or less bytes")
 	}
 
-	printContent(string(buf[:n]))
+	debug(fmt.Sprintf("read %d bytes from %s", buflen, f.Name()))
 
-	return fsize
+	return string(buf[:n]), fsize
 }
 
 // extractLineCount parses the given string to a usable int value
