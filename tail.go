@@ -109,6 +109,12 @@ func main() {
 
 	debug(fmt.Sprintf("%d files to tail", len(files)))
 
+	// limit number of files to 5 to reduce clutter
+	if len(files) > 5 {
+		handleErrorAndExit(errors.New("too many files to tail"),
+			"max file limit is 5, would be too much information for ya")
+	}
+
 	// if not tail count is provided, set default tail count to 5,
 	// awkward otherwise
 	if lcount == 0 {
