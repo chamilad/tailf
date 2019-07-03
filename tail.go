@@ -47,7 +47,9 @@ func main() {
 		<-sigs
 		debug("signal received")
 
-		done <- true
+		// close the channel to broadcast, otherwise only one listener
+		// receives the message
+		close(done)
 	}()
 
 	debug("processing input")
@@ -409,8 +411,11 @@ func watchFile(fd int, fname string) uint32 {
 func handleErrorAndExit(e error, msg string) {
 	if e != nil {
 		printErr(fmt.Sprintf("%s: %s\n", msg, e))
-		// todo: defers are not run after this, need to close resources
-		//  properly. maybe send signals instead of this?
+		// os.Exit() here will not run defers
+		// tried sending signals, however the receivers do not kick
+		// into action soon enough in some cases. Routines that manage
+		// resources should take care to carefully release them without
+		// depending on defer funcs too much.
 		os.Exit(1)
 	}
 }
