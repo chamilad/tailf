@@ -14,12 +14,15 @@ Works only on Linux, tested only on Ubuntu with an 88/256 terminal
 ```bash
 $ tailf -5 someserver.log
 ```
+![tailing a single file](img/single-file.png)
 
 #### Tail multiple files
 ```bash
 $ tailf someserver.log someserver-access.log someserver-error.log
 ```
 When tailing multiple files, the filename will be prefixed to the output
+
+![tailing multiple files](img/multiple-files.png)
 
 ## License
 Apache v2 

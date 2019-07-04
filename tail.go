@@ -33,6 +33,18 @@ const (
 // TODO: instrument and perf test
 // TODO: manage error messages
 // TODO: checkout magefile as a build system
+
+var (
+	outputColors = [5]func(string) string{red, yellow, blue, magenta, green}
+)
+
+// structure to collect tailing file info
+type TailedFile struct {
+	name  string
+	f     *os.File
+	color func(string) string ``
+}
+
 func main() {
 	debug("registering signal trap")
 	// channels to trap signals
@@ -68,7 +80,7 @@ func main() {
 	args := os.Args[1:]
 
 	// list of files to tail
-	files := make([]string, 0)
+	files := make([]*TailedFile, 0)
 
 	// parse arguments
 	for _, arg := range args {
@@ -93,14 +105,14 @@ func main() {
 			lcount = lc
 		} else {
 			// should be either a single file name, multiple filenames or a file pattern
-			// shadowing, so using f to temp store string value
-			f, err := parseFileName(arg)
+			// shadowing, so using tf to temp store string value
+			tf, err := parseFileName(arg)
 			if err != nil {
 				printErr(fmt.Sprintf("file not found: %s", arg))
 				showUsageAndExit()
 			}
 
-			files = append(files, f)
+			files = append(files, tf)
 		}
 	}
 
@@ -144,12 +156,15 @@ func main() {
 	// 1. register an inotify watch
 	// 2. spawn an inotify event watcher
 	// 3. spawn an event consumer
-	// todo: decide color for each file
-	for _, fname := range files {
-		debug(fmt.Sprintf("registering tailer for %s", fname))
+	for i, tf := range files {
+		debug(fmt.Sprintf("registering tailer for %s", tf.name))
 		// create file handler for file
-		f, err := os.Open(fname)
-		handleErrorAndExit(err, fmt.Sprintf("error while opening file: %s", fname))
+		f, err := os.Open(tf.name)
+		handleErrorAndExit(err, fmt.Sprintf("error while opening file: %s", tf.name))
+
+		// populate data structure
+		tf.f = f
+		tf.color = outputColors[i]
 
 		// close the handler later
 		defer func(f *os.File) {
@@ -159,7 +174,9 @@ func main() {
 			}
 		}(f)
 
+		// start watching the file
 		wd := watchFile(fd, f.Name())
+		// add to watches to be closed
 		wds = append(wds, wd)
 
 		// if a line count is provided, rewind cursor
@@ -171,7 +188,7 @@ func main() {
 		// cursor is at EOF-1
 
 		if len(files) > 1 {
-			printContentWithFileName(f.Name(), content)
+			printContentWithFileName(tf, content)
 		} else {
 			printContent(content)
 		}
@@ -250,7 +267,7 @@ func main() {
 							content, rsize := readContentToEOF(f)
 							lastFSize = rsize
 							if len(files) > 1 {
-								printContentWithFileName(f.Name(), content)
+								printContentWithFileName(tf, content)
 							} else {
 								printContent(content)
 							}
@@ -269,7 +286,7 @@ func main() {
 								content, rsize := readContentToEOF(f)
 								lastFSize = rsize
 								if len(files) > 1 {
-									printContentWithFileName(f.Name(), content)
+									printContentWithFileName(tf, content)
 								} else {
 									printContent(content)
 								}
@@ -281,7 +298,7 @@ func main() {
 								content, rsize := readContentToEOF(f)
 								lastFSize = rsize
 								if len(files) > 1 {
-									printContentWithFileName(f.Name(), content)
+									printContentWithFileName(tf, content)
 								} else {
 									printContent(content)
 								}
@@ -320,7 +337,7 @@ func main() {
 // parseFileName accepts a string argument and checks to see if the
 // file with the absolute path exists or not
 // Returns the absoulte filename and an error if the file doesn't exist
-func parseFileName(s string) (string, error) {
+func parseFileName(s string) (*TailedFile, error) {
 	// todo: expand by wildcards,
 	//  ? - any single char
 	//  * - any multiple chars
@@ -330,13 +347,17 @@ func parseFileName(s string) (string, error) {
 	//  \ - escape
 	//  NOTE: not urgent, can work with tools like find
 	fname, err := filepath.Abs(s)
-	handleErrorAndExit(err, "e	rror while converting filenames")
+	handleErrorAndExit(err, "error while converting filenames")
 
 	// check if file exists
 	_, err = os.Stat(fname)
 	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
 
-	return fname, nil
+	tf := &TailedFile{
+		name: fname,
+	}
+
+	return tf, nil
 }
 
 // showVersionAndExit shows version details
@@ -358,13 +379,13 @@ func printContent(s string) {
 
 // printContentWithFileName prints the given content to stdout,
 // prefixing each line with the base name of the given filename
-func printContentWithFileName(fname, content string) {
-	debug(fmt.Sprintf("printing line for %s", fname))
+// the prefixing filename is colored with a distinctive color
+func printContentWithFileName(f *TailedFile, content string) {
+	debug(fmt.Sprintf("printing line for %s", f.name))
 	lines := strings.Split(strings.Trim(content, "\n"), "\n")
 	for _, l := range lines {
-		bfn := filepath.Base(fname)
-		bbfn := fmt.Sprintf("\x1b[1m%s => \x1b[0m", bfn)
-		printContent(fmt.Sprintf("%s %s\n", bbfn, l))
+		bfn := filepath.Base(f.name)
+		printContent(fmt.Sprintf("%s %s\n", f.color(bfn+" => "), l))
 	}
 }
 
@@ -407,7 +428,6 @@ func watchFile(fd int, fname string) uint32 {
 }
 
 // handleErrorAndExit will exit with 1 if there is an error
-// todo: crude
 func handleErrorAndExit(e error, msg string) {
 	if e != nil {
 		printErr(fmt.Sprintf("%s: %s\n", msg, e))
@@ -582,4 +602,34 @@ func extractLineCount(s string) (int, error) {
 	} else {
 		return int(i), nil
 	}
+}
+
+// red colors the given string to red, with ANSI/VT100 88/256
+// color sequences
+func red(s string) string {
+	return fmt.Sprintf("\x1b[1;31m%s\x1b[0m", s)
+}
+
+// yellow colors the given string to yellow, with ANSI/VT100 88/256
+// color sequences
+func yellow(s string) string {
+	return fmt.Sprintf("\x1b[1;33m%s\x1b[0m", s)
+}
+
+// blue colors the given string to blue, with ANSI/VT100 88/256
+// color sequences
+func blue(s string) string {
+	return fmt.Sprintf("\x1b[1;34m%s\x1b[0m", s)
+}
+
+// magenta colors the given string to magenta, with ANSI/VT100 88/256
+// color sequences
+func magenta(s string) string {
+	return fmt.Sprintf("\x1b[1;35m%s\x1b[0m", s)
+}
+
+// green colors the given string to green, with ANSI/VT100 88/256
+// color sequences
+func green(s string) string {
+	return fmt.Sprintf("\x1b[1;32m%s\x1b[0m", s)
 }
