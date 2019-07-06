@@ -17,7 +17,7 @@ import (
 
 const (
 	// show debug information, for dev cycles
-	DEBUG_MODE = false
+	DEBUG_MODE = true
 )
 
 // usage: tailf <filename>
@@ -31,7 +31,7 @@ const (
 
 // TODO: manpage maybe?
 // TODO: instrument and perf test
-// TODO: manage error messages
+// TODO: error handling should be meaningful
 // TODO: checkout magefile as a build system
 
 var (
@@ -40,12 +40,13 @@ var (
 
 // structure to collect tailing file info
 type FileTailer struct {
-	name     string
-	file     *os.File
-	fileSize int64
-	wd       uint32
-	fd       int
-	color    func(string) string
+	name           string
+	file           *os.File
+	fileSize       int64
+	wd             uint32
+	fd             int
+	contentPrinter chan<- *PrintContent
+	color          func(string) string
 }
 
 type EventReader struct {
@@ -60,6 +61,42 @@ type PrintContent struct {
 
 type ContentPrinter struct {
 	multiFile bool
+}
+
+type Dispatch struct {
+	tailers map[uint32]*FileTailer
+}
+
+func (d *Dispatch) start(events <-chan syscall.InotifyEvent, done <-chan bool) {
+	for {
+		select {
+		case <-done:
+			debug("received notice to shutdown")
+			return
+		case event := <-events:
+			uwd := uint32(event.Wd)
+			debug(fmt.Sprintf("received inotify event for wd %d by dispatch", uwd))
+			if t, ok := d.tailers[uwd]; ok {
+				t.processEvent(event)
+				debug("dispatched event to tailer")
+			} else {
+				debug(fmt.Sprintf("received event is for a wd without a tailer at the moment: %d", uwd))
+			}
+		}
+	}
+}
+
+func (d *Dispatch) registerTailer(wd uint32, t *FileTailer) {
+	d.tailers[wd] = t
+}
+
+func (d *Dispatch) shutdown() {
+	debug(fmt.Sprintf("dispatch: shutting down, %d filetailers to close", len(d.tailers)))
+	for _, t := range d.tailers {
+		// schedule open file handlers to be closed
+		debug(fmt.Sprintf("dispatch: closing file tailer %s", t.file.Name()))
+		t.close()
+	}
 }
 
 func (p *ContentPrinter) start(contents <-chan *PrintContent, done <-chan bool) {
@@ -97,23 +134,34 @@ func newFileTailer(fd int, name string, c func(string) string) *FileTailer {
 	return t
 }
 
-// refresh closes the existing filehandler and opens a new one
+// refresh closes the existing filehandler and opens a new one. It
+// also closes the Inotify watch opened for the older filehandler
+// and opens a new one.
 // Useful when the current filehandler goes stale, when ex:
 // the file gets deleted but the same file is recreated after
 // sometime
-func (t *FileTailer) refresh() {
+func (t *FileTailer) refresh() error {
 	t.unregisterWatch()
 	_ = t.file.Close()
 
 	// file appeared, open a new file handler
 	f, err := os.Open(t.name)
 	// todo: throw these errors
-	handleErrorAndExit(err, fmt.Sprintf("error while reopening file: %s", t.name))
+	//handleErrorAndExit(err, fmt.Sprintf("error while reopening file: %s", t.name))
+	if err != nil {
+		return err
+	}
 
 	t.file = f
-	t.registerWatch()
+	err = t.registerWatch()
+	//if err != nil {
+	//	return err
+	//}
+
+	return nil
 }
 
+//
 func (t *FileTailer) openFile() {
 	f, err := os.Open(t.name)
 	handleErrorAndExit(err, fmt.Sprintf("error while opening file: %s", t.name))
@@ -121,14 +169,18 @@ func (t *FileTailer) openFile() {
 	t.file = f
 }
 
-func (t *FileTailer) registerWatch() {
-	debug(fmt.Sprintf("adding watch for file %s", t.file.Name()))
+// registerWatch adds an Inotify watch on the file currently in use
+func (t *FileTailer) registerWatch() error {
+	debug(fmt.Sprintf("adding watch for file %s under %d", t.file.Name(), t.fd))
 	wd, err := syscall.InotifyAddWatch(
 		t.fd,
 		t.file.Name(),
 		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|
 			syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
 	//syscall.IN_ALL_EVENTS)
+	//if err != nil {
+	//	return errors.New(fmt.Sprintf("cannot watch file %s", t.file.Name()))
+	//}
 	handleErrorAndExit(
 		err,
 		fmt.Sprintf(
@@ -137,135 +189,118 @@ func (t *FileTailer) registerWatch() {
 
 	t.wd = uint32(wd)
 	debug(fmt.Sprintf("wd for watched file: %d", t.wd))
+
+	return nil
 }
 
+// unregisterWatch removes the Inotify watch
 func (t *FileTailer) unregisterWatch() {
 	debug(fmt.Sprintf("removing watch: %d", t.wd))
 	syscall.InotifyRmWatch(t.fd, t.wd)
 }
 
-func (t *FileTailer) watch(events <-chan syscall.InotifyEvent, content chan<- *PrintContent, done <-chan bool) {
+// start starts an infinite loop to wait on either InotifyEvents from
+// the EventReader or for the done channel to be closed (which
+// indicates a shutdown). On interesting events, it reads the file and
+// pushes content to content channel to be printed by a printer
+// This is expected to be run as a goroutine
+func (t *FileTailer) processEvent(e syscall.InotifyEvent) {
 	//ConLoop:
-	for {
-		select {
-		case <-done:
-			debug("received notice to shutdown")
-			//break ConLoop
-			return
-		case event := <-events:
-			// is this an event for the file we are currently
-			// interested in?
-			if uint32(event.Wd) == t.wd {
-				switch event.Mask {
-				case syscall.IN_MOVE_SELF:
-					// file moved, close current file handler and
-					// open a new one
-					debug("FILE MOVED")
+	//for {
+	//	select {
+	//	case <-done:
+	//		debug("received notice to shutdown")
+	//		//break ConLoop
+	//		return
+	//	case event := <-events:
+	//		// is this an event for the file we are currently
+	//		// interested in?
+	//		debug(fmt.Sprintf("received inotify event for wd %d by tailer %d", uint32(event.Wd), t.wd))
+	//		if uint32(event.Wd) == t.wd {
+	switch e.Mask {
+	case syscall.IN_MOVE_SELF:
+		// file moved, close current file handler and
+		// open a new one
+		debug("FILE MOVED")
 
-					// wait for new file to appear
-					for {
-						_, err := os.Stat(t.file.Name())
-						if err == nil {
-							break
-						}
-
-						debug("file not yet appeared")
-
-						// todo exponential backoff, give up after a certain time
-						// there is a window to miss some events,
-						// during timeout if the file is created and
-						// written to, we miss those events
-						// those possible writes are covered by the
-						// readContentToEOF() done later after creating
-						// a new wd
-						time.Sleep(2 * time.Second)
-					}
-
-					// file appeared, open a new file handler
-					t.refresh()
-
-					// refresh inotify watch
-					//owd := cwd
-					// add a new watch
-
-					//nwd := watchFile(fd, tf.name)
-					//mark it to be closed during shutdown
-					//wds = append(wds, nwd)
-					// set current wd to the new wd
-					//cwd = nwd
-
-					// show any content created during the timeout
-					// also reset last read file size
-					content <- t.readFile()
-					//content, rsize := readContentToEOF(t.file)
-					//t.fileSize = rsize
-					//if len(files) > 1 {
-					//	printContentWithFileName(t, content)
-					//} else {
-					//	printContent(content)
-					//}
-
-					// remove existing inotify watch
-					//_, _ = removeWatch(fd, owd)
-				case syscall.IN_MODIFY:
-					// file was written to or truncated, need to determine what happened
-					finfo, err := os.Stat(t.file.Name())
-					handleErrorAndExit(err, "error while sizing file during modify event")
-
-					if finfo.Size() < t.fileSize {
-						debug("FILE TRUNCATED")
-
-						// file has been truncated, go to the beginning
-						_, _ = t.file.Seek(0, io.SeekStart)
-					} else if finfo.Size() > t.fileSize {
-						// file has been written into, ie "write()"
-						// no need to seek anywhere
-						debug("FILE WRITTEN")
-
-						//content, rsize := readContentToEOF(t.file)
-						//t.fileSize = rsize
-						//if len(files) > 1 {
-						//	printContentWithFileName(t, content)
-						//} else {
-						//	printContent(content)
-						//}
-					}
-
-					content <- t.readFile()
-					//content, rsize := readContentToEOF(t.file)
-					//t.fileSize = rsize
-					//if len(files) > 1 {
-					//	printContentWithFileName(t, content)
-					//} else {
-					//	printContent(content)
-					//}
-				case syscall.IN_ATTRIB:
-					debug(fmt.Sprintf("ATTRIB received: %d", event.Wd))
-
-					// rm sends an IN_ATTRIB possibly because of unlink()
-					// check if file deleted and not any other
-					// IN_ATTRIB source
-					_, err := os.Stat(t.file.Name())
-					if err != nil {
-						debug("FILE DELETED, TIME TO DIE")
-						// let defers be executed. os.Exit() would not allow that
-						//break ConLoop
-						return
-					}
-				case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
-					debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
-
-					// file was deleted, exit
-					//_ = tf.file.Close()
-					// let defers be executed. os.Exit() would not allow that
-					//break ConLoop
-					return
-				}
+		// wait for new file to appear
+		for {
+			_, err := os.Stat(t.file.Name())
+			if err == nil {
+				break
 			}
+
+			debug("file not yet appeared")
+
+			// todo exponential backoff, give up after a certain time
+			// there is a window to miss some events,
+			// during timeout if the file is created and
+			// written to, we miss those events
+			// those possible writes are covered by the
+			// readContentToEOF() done later after creating
+			// a new wd
+			time.Sleep(2 * time.Second)
 		}
+
+		// file appeared, open a new file handler and
+		// refresh Inotify watch
+		err := t.refresh()
+		if err != nil {
+			return
+		}
+
+		// show any content created during the timeout
+		// also reset last read file size
+		t.contentPrinter <- t.readFile()
+	case syscall.IN_MODIFY:
+		// file was written to or truncated, need to determine what happened
+		finfo, err := os.Stat(t.file.Name())
+		handleErrorAndExit(err, "error while sizing file during modify event")
+
+		if finfo.Size() < t.fileSize {
+			debug("FILE TRUNCATED")
+
+			// file has been truncated, go to the beginning
+			_, _ = t.file.Seek(0, io.SeekStart)
+		} else if finfo.Size() > t.fileSize {
+			// file has been written into, ie "write()"
+			// no need to seek anywhere
+			debug("FILE WRITTEN")
+		}
+
+		// read and print content
+		t.contentPrinter <- t.readFile()
+	case syscall.IN_ATTRIB:
+		debug(fmt.Sprintf("ATTRIB received: %d", e.Wd))
+
+		// rm sends an IN_ATTRIB possibly because of unlink()
+		// check if file deleted and not any other
+		// IN_ATTRIB source
+		_, err := os.Stat(t.file.Name())
+		if err != nil {
+			debug("FILE DELETED, TIME TO DIE")
+			// end the watch cycle, and possibly the
+			// invoking goroutine
+			return
+		}
+	case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
+		debug("FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE")
+
+		// end the watch cycle, and possibly the
+		// invoking goroutine
+		return
 	}
+	//}
+	//}
+	//}
 }
 
+// readFile reads the file from the current cursor position to the end
+// of file. The current file size is updated at the same time of the
+// read.
+// Returns a PrintContent struct with the read content, the filename,
+// and the color to be printed with. This method can be used directly
+// to feed a ContentPrinter.
 func (t *FileTailer) readFile() *PrintContent {
 	// get current position
 	curPos, err := t.file.Seek(0, io.SeekCurrent)
@@ -276,8 +311,6 @@ func (t *FileTailer) readFile() *PrintContent {
 
 	// len to read is total file size - current position
 	t.fileSize = finfo.Size()
-	//t.fileSize = fsize
-
 	buflen := t.fileSize - curPos
 
 	buf := make([]byte, buflen)
@@ -289,7 +322,6 @@ func (t *FileTailer) readFile() *PrintContent {
 
 	debug(fmt.Sprintf("read %d bytes from %s", buflen, t.file.Name()))
 
-	//debug(fmt.Sprintf("sending back: %s", string(buf[:n])))
 	return &PrintContent{
 		content:  string(buf[:n]),
 		filename: t.file.Name(),
@@ -297,23 +329,39 @@ func (t *FileTailer) readFile() *PrintContent {
 	}
 }
 
+// close removes the Inotify watch and closes the file handler. This is
+// intended to be done during a shutdown
 func (t *FileTailer) close() {
 	debug(fmt.Sprintf("closing file tailer %s", filepath.Base(t.name)))
 	t.unregisterWatch()
 	t.file.Close()
 }
 
-//func (t *FileTailer) stop() {
-//
-//}
+// init opens an Inotify kernel structure
+func (e *EventReader) init() {
+	debug("initializing inotify")
+	// TODO: apparently syscall is deprecated, use sys pkg later
+	// TODO: check if fd opened below needs to be closed
+	fd, err := syscall.InotifyInit()
+	handleErrorAndExit(err, "error while inotify init")
 
+	e.fd = fd
+}
+
+// start starts an infinite loop to read InotifyEvent structures from
+// it. The read() syscall is a blocking one until any data is present.
+// Once the inotify events are present, the events are unmarshalled
+// and communicated to the consumer
+// At the moment, the read() call could close improperly if the main
+// thread gives out. Need a way to timeout based on a notification
+// from the main thread at the read().
 func (e *EventReader) start(events chan<- syscall.InotifyEvent) {
 	for {
 		buf := make([]byte, (syscall.SizeofInotifyEvent+syscall.NAME_MAX+1)*10)
 
 		// read from the opened inotify file descriptor, into buf
 		// read() is blocking until some data is available
-		debug("reading inotify event list")
+		debug("waiting for inotify event list")
 		n, err := syscall.Read(e.fd, buf)
 		handleErrorAndExit(err, "error while reading inotify file")
 
@@ -321,6 +369,8 @@ func (e *EventReader) start(events chan<- syscall.InotifyEvent) {
 		if n <= 0 {
 			printErr("inotify read resulted in EOF")
 		}
+
+		debug(fmt.Sprintf("read %d from inotify", n))
 
 		// read the buffer for all its events
 		offset := 0
@@ -340,6 +390,7 @@ func (e *EventReader) start(events chan<- syscall.InotifyEvent) {
 			// notify the waiting consumer of the event
 			// TODO buffer and gather all modify events to one to avoid spamming the consumer thread
 			events <- event
+			debug(fmt.Sprintf("sent event for wd %d to queue", event.Wd))
 
 			// move the window and read the next event
 			offset += syscall.SizeofInotifyEvent + int(event.Len)
@@ -349,10 +400,7 @@ func (e *EventReader) start(events chan<- syscall.InotifyEvent) {
 
 func main() {
 	debug("processing input")
-	// watch descriptors to be closed
-	//var wds []uint32
-
-	// line count to watch with
+	// line count to start with
 	var lcount int
 
 	// args without bin name
@@ -389,7 +437,6 @@ func main() {
 			lcount = lc
 		} else {
 			// should be either a single file name, multiple filenames or a file pattern
-			// shadowing, so using tf to temp store string value
 			fname, err := parseFileName(arg)
 			if err != nil {
 				printErr(fmt.Sprintf("file not found: %s", arg))
@@ -413,15 +460,12 @@ func main() {
 			"max file limit is 5, would be too much information for ya")
 	}
 
-	// if not tail count is provided, set default tail count to 5,
+	// if no tail count is provided, set default tail count to 5,
 	// awkward otherwise
 	if lcount == 0 {
 		lcount = 5
 	}
 
-	debug("registering signal trap")
-	// channels to trap signals
-	sigs := make(chan os.Signal, 1)
 	// channel to ping workers to shutdown when a signal is received
 	done := make(chan bool, 1)
 	// this channel communicates the events
@@ -429,6 +473,9 @@ func main() {
 	// channel to pass read content from tailer to printer
 	content := make(chan *PrintContent)
 
+	debug("registering signal trap")
+	// channels to trap signals
+	sigs := make(chan os.Signal, 1)
 	// subscribe for 9 and 15 signals
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
@@ -441,82 +488,74 @@ func main() {
 		// close the channel to broadcast, otherwise only one listener
 		// receives the message
 		close(done)
+		debug("sent message to shutdown")
 	}()
 
-	debug("creating inotify event")
-	// TODO: apparently syscall is deprecated, use sys pkg later
-	// TODO: check if fd opened below needs to be closed
-	fd, err := syscall.InotifyInit()
-	handleErrorAndExit(err, "error while inotify init")
-
-	tailers := make([]*FileTailer, 0)
-
-	// not passing values to be evaled later
-	defer func() {
-		debug(fmt.Sprintf("defer func, %d file tailers", len(tailers)))
-		for _, t := range tailers {
-			// schedule open file handlers to be closed
-			debug(fmt.Sprintf("defer: closing file tailer %s", t.file.Name()))
-			t.close()
-
-			// schedule open wds to be closed during shutdown
-			//debug(fmt.Sprintf("defer: closing wd %d", t.wd))
-			//t.unregisterWatch()
-			//_, _ = removeWatch(fd, t.wd)
-		}
-	}()
+	// list of tailers. this maintains a point for defer func to later
+	// shutdown
+	//tailers := make([]*FileTailer, 0)
 
 	// start printer early
 	printer := &ContentPrinter{
+		// this flag determines if the filename is prefixed on the line
+		// printing
 		multiFile: len(files) > 1,
 	}
 	go printer.start(content, done)
 
+	// start an Inotify event reader loop
+	// though there are no consumers at this point, the events will be
+	// collected in the channel
+	eventReader := &EventReader{}
+	eventReader.init()
+	go eventReader.start(events)
+
+	dispatch := &Dispatch{
+		tailers: make(map[uint32]*FileTailer),
+	}
+
+	defer func() {
+		debug("defer: shutting down dispatch")
+		dispatch.shutdown()
+	}()
+
 	// for each filename given,
-	// 1. registerWatch an inotify watch
-	// 2. spawn an inotify event watcher
-	// 3. spawn an event consumer
+	// 1. register an inotify watch
+	// 2. spawn an event consumer
 	// todo: go func content of this loop, otherwise last lines are printed one after the other
 	for i, fname := range files {
 		debug(fmt.Sprintf("registering tailer for %s", fname))
 
 		// create a worker
-		t := newFileTailer(fd, fname, outputColors[i])
-		tailers = append(tailers, t)
+		t := newFileTailer(eventReader.fd, fname, outputColors[i])
+		//tailers = append(tailers, t)
 
 		// create a file handler
 		t.openFile()
 
-		// watch watching the file
-		t.registerWatch()
+		// start watching the file
+		err := t.registerWatch()
+		// if the file can't be watched, crash and burn
+		if err != nil {
+			panic(err)
+		}
+
+		dispatch.registerTailer(t.wd, t)
 
 		// if a line count is provided, rewind cursor
 		// the file should be read from the end, backwards
 		debug("tailing last lines")
 		seekBackwardsByLineCount(lcount, t.file)
 
-		// read content and queue to be printed
+		// read from the rewound position to EOF and queue to be
+		// printed
 		content <- t.readFile()
 
-		// read from the rewound position to EOF
-		//content, lastFSize := readContentToEOF(t.file)
-		// cursor is at EOF-1
-		//
-		//if len(files) > 1 {
-		//	printContentWithFileName(t, content)
-		//} else {
-		//	printContent(content)
-		//}
-
 		// start consumer loop
-		go t.watch(events, content, done)
+		//go t.start(events, content, done)
 	}
 
-	// start an Inotify event reader loop
-	eventReader := &EventReader{
-		fd: fd,
-	}
-	go eventReader.start(events)
+	dispatch.start(events, done)
 
 	// holding the main thread until shutdown
 	<-done
@@ -542,10 +581,6 @@ func parseFileName(s string) (string, error) {
 	_, err = os.Stat(fname)
 	handleErrorAndExit(err, fmt.Sprintf("file not found: %s", fname))
 
-	//tf := &FileTailer{
-	//	name: fname,
-	//}
-
 	return fname, nil
 }
 
@@ -561,23 +596,6 @@ func showUsageAndExit() {
 	os.Exit(0)
 }
 
-// printContent writes the given string to stdout
-//func printContent(s string) {
-//	_, _ = fmt.Fprint(os.Stdout, s)
-//}
-
-// printContentWithFileName prints the given content to stdout,
-// prefixing each line with the base name of the given filename
-// the prefixing filename is colored with a distinctive color
-//func printContentWithFileName(f *FileTailer, content string) {
-//	debug(fmt.Sprintf("printing line for %s", f.name))
-//	lines := strings.Split(strings.Trim(content, "\n"), "\n")
-//	for _, l := range lines {
-//		bfn := filepath.Base(f.name)
-//		printContent(fmt.Sprintf("%s %s\n", f.color(bfn+" => "), l))
-//	}
-//}
-
 // printErr prints the given message to stderr
 func printErr(s string) {
 	_, _ = fmt.Fprintf(os.Stderr, "%s\n", s)
@@ -591,31 +609,6 @@ func debug(s string) {
 	}
 }
 
-// removeWatch stops watching a file by removing a given watch
-// descriptor from the given inotify file descriptor
-//func removeWatch(fd int, wd uint32) (int, error) {
-//	debug(fmt.Sprintf("removing watch: %d", wd))
-//	return syscall.InotifyRmWatch(fd, wd)
-//}
-
-// watchFile adds a new inotify watch for a given file at the given
-// inotify file descriptor.
-// Returns the created watch descriptor
-//func watchFile(fd int, fname string) uint32 {
-//	debug("adding watch")
-//	wd, err := syscall.InotifyAddWatch(
-//		fd,
-//		fname,
-//		syscall.IN_MOVE_SELF|syscall.IN_DELETE_SELF|syscall.IN_ATTRIB|
-//			syscall.IN_MODIFY|syscall.IN_UNMOUNT|syscall.IN_IGNORED)
-//	//syscall.IN_ALL_EVENTS)
-//	handleErrorAndExit(err, fmt.Sprintf("error while adding an inotify watch: %s", fname))
-//
-//	uwd := uint32(wd)
-//	debug(fmt.Sprintf("wd for watched file: %d", uwd))
-//	return uwd
-//}
-
 // handleErrorAndExit will exit with 1 if there is an error
 func handleErrorAndExit(e error, msg string) {
 	if e != nil {
@@ -628,53 +621,6 @@ func handleErrorAndExit(e error, msg string) {
 		os.Exit(1)
 	}
 }
-
-// checkInotifyEvents runs an infinite loop reading the given inotify
-// file descriptor. The read() syscall is a blocking one until any data
-// is present. Once the inotify events are present, the events are
-// unmarshalled and the event mask is communicated to the consumer
-// At the moment, the read() call could close improperly if the main
-// thread gives out. Need a way to timeout based on a notification
-// from the main thread.
-//func checkInotifyEvents(fd int, events chan<- syscall.InotifyEvent) {
-//	for {
-//		buf := make([]byte, (syscall.SizeofInotifyEvent+syscall.NAME_MAX+1)*10)
-//
-//		// read from the opened inotify file descriptor, into buf
-//		// read() is blocking until some data is available
-//		debug("reading inotify event list")
-//		n, err := syscall.Read(fd, buf)
-//		handleErrorAndExit(err, "error while reading inotify file")
-//
-//		// check if the read value is 0
-//		if n <= 0 {
-//			printErr("inotify read resulted in EOF")
-//		}
-//
-//		// read the buffer for all its events
-//		offset := 0
-//		for {
-//			if offset+syscall.SizeofInotifyEvent > n {
-//				debug("reached end of inotify buffer")
-//				break
-//			}
-//
-//			// unmarshal to struct
-//			var event syscall.InotifyEvent
-//			err = binary.Read(bytes.NewReader(buf[offset:(offset+syscall.SizeofInotifyEvent+1)]), binary.LittleEndian, &event)
-//			handleErrorAndExit(err, "error while reading inotify events from the buf")
-//
-//			debug(fmt.Sprintf("read inotify event for wd %d", event.Wd))
-//
-//			// notify the waiting consumer of the event
-//			// TODO buffer and gather all modify events to one to avoid spamming the consumer thread
-//			events <- event
-//
-//			// move the window and read the next event
-//			offset += syscall.SizeofInotifyEvent + int(event.Len)
-//		}
-//	}
-//}
 
 // seekBackwardsByLineCount will move the read position of the passed
 // file until the specified line count from end is met
@@ -700,7 +646,7 @@ func seekBackwardsByLineCount(lc int, f *os.File) {
 
 	// loop until lc is passed
 	for ; ; offset-- {
-		// check if we are past the file watch
+		// check if we are past the file start
 		if offset+fsize == 0 {
 			// if so, return this position, there's no room to backup
 			break
@@ -752,33 +698,6 @@ func seekBackwardsByLineCount(lc int, f *os.File) {
 	// show the lines up to EOF
 	//return readContentToEOF(file)
 }
-
-// readContentToEOF reads the given file from the current cursor
-// position to the end of file.
-// Returns the read content and the file size at the time of read
-//func readContentToEOF(f *os.File) (string, int64) {
-//// get current position
-//curPos, err := f.Seek(0, io.SeekCurrent)
-//handleErrorAndExit(err, "error while getting current cursor pos")
-//
-//finfo, err := os.Stat(f.Name())
-//handleErrorAndExit(err, "error while getting filesize")
-//
-//// len to read is total file size - current position
-//fsize := finfo.Size()
-//buflen := fsize - curPos
-//
-//buf := make([]byte, buflen)
-//n, err := f.Read(buf)
-//handleErrorAndExit(err, "couldn't read line count")
-//if n <= 0 {
-//	debug("reading file returned 0 or less bytes")
-//}
-//
-//debug(fmt.Sprintf("read %d bytes from %s", buflen, f.Name()))
-//
-//return string(buf[:n]), fsize
-//}
 
 // readLineCountArg parses the given string to a usable int value
 // It can tolerate - prefix
