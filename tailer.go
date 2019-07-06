@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -101,7 +102,7 @@ func (t *FileTailer) unregisterWatch() {
 // indicates a shutdown). On interesting events, it reads the file and
 // pushes content to content channel to be printed by a printer
 // This is expected to be run as a goroutine
-func (t *FileTailer) processEvent(e syscall.InotifyEvent) {
+func (t *FileTailer) processEvent(e syscall.InotifyEvent) (uint32, error) {
 	debug(fmt.Sprintf("tailer %d: received event to process %d", t.wd, e.Wd))
 
 	switch e.Mask {
@@ -123,6 +124,8 @@ func (t *FileTailer) processEvent(e syscall.InotifyEvent) {
 
 		// read and print content
 		t.contentQ <- t.readFile()
+
+		return 0, nil
 	case syscall.IN_MOVE_SELF:
 		// file moved, close current file handler and
 		// open a new one
@@ -151,12 +154,14 @@ func (t *FileTailer) processEvent(e syscall.InotifyEvent) {
 		// refresh Inotify watch
 		err := t.refresh()
 		if err != nil {
-			return
+			return 0, err
 		}
 
 		// show any content created during the timeout
 		// also reset last read file size
 		t.contentQ <- t.readFile()
+
+		return t.wd, nil
 	case syscall.IN_ATTRIB:
 		debug(fmt.Sprintf("tailer %d: ATTRIB received: %d", t.wd, e.Wd))
 
@@ -168,15 +173,20 @@ func (t *FileTailer) processEvent(e syscall.InotifyEvent) {
 			debug(fmt.Sprintf("tailer %d: FILE DELETED, TIME TO DIE", t.wd))
 			// end the watch cycle, and possibly the
 			// invoking goroutine
-			return
+			return 0, errors.New("file deleted")
 		}
+
+		return 0, nil
 	case syscall.IN_DELETE_SELF, syscall.IN_IGNORED, syscall.IN_UNMOUNT:
 		debug(fmt.Sprintf("tailer %d: FILE DELETED, IGNORED, OR UNMOUNTED, TIME TO DIE", t.wd))
 
 		// end the watch cycle, and possibly the
 		// invoking goroutine
-		return
+		//return t.wd, nil
+		return 0, errors.New("file deleted")
 	}
+
+	return 0, errors.New("received event not interested in")
 }
 
 // readFile reads the file from the current cursor position to the end

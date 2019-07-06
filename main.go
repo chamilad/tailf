@@ -14,7 +14,7 @@ import (
 
 const (
 	// show debug information, for dev cycles
-	DEBUG_MODE = true
+	DEBUG_MODE = false
 )
 
 // usage: tailf <filename>

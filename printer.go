@@ -17,6 +17,8 @@ type ContentPrinter struct {
 	multiFile bool
 }
 
+// start initiates a loop that will constantly watch for print events
+// and output them using the information provided
 func (p *ContentPrinter) start(contents <-chan *PrintContent, done <-chan bool) {
 	for {
 		select {
@@ -30,6 +32,9 @@ func (p *ContentPrinter) start(contents <-chan *PrintContent, done <-chan bool) 
 	}
 }
 
+// print prints the given PrintContent object to stdout
+// Whether a color should be used and the filename should be prefixed
+// is determined by the PrintContent config
 func (p *ContentPrinter) print(c *PrintContent) {
 	debug(fmt.Sprintf("printer: printing line for %s", c.filename))
 	if p.multiFile {
