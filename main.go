@@ -61,6 +61,7 @@ func main() {
 			// is it the help flag
 			if arg == "-h" || arg == "--help" {
 				showUsage()
+				os.Exit(0)
 			}
 
 			// is it the version flag
@@ -81,6 +82,7 @@ func main() {
 			if err != nil {
 				printErr(fmt.Sprintf("file not found: %s", arg))
 				showUsage()
+				os.Exit(0)
 			}
 
 			files = append(files, fname)
