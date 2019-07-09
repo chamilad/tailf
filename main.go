@@ -33,6 +33,8 @@ const (
 
 var (
 	outputColors = [5]func(string) string{red, yellow, blue, magenta, green}
+	Version string
+	Build string
 )
 
 func main() {
@@ -58,12 +60,13 @@ func main() {
 
 			// is it the help flag
 			if arg == "-h" || arg == "--help" {
-				showUsageAndExit()
+				showUsage()
 			}
 
 			// is it the version flag
 			if arg == "-v" || arg == "--version" {
-				showVersionAndExit()
+				showVersion()
+				os.Exit(0)
 			}
 
 			// is it the line count flag
@@ -77,7 +80,7 @@ func main() {
 			fname, err := parseFileName(arg)
 			if err != nil {
 				printErr(fmt.Sprintf("file not found: %s", arg))
-				showUsageAndExit()
+				showUsage()
 			}
 
 			files = append(files, fname)
@@ -156,7 +159,6 @@ func main() {
 	// for each filename given,
 	// 1. register an inotify watch
 	// 2. spawn an event consumer
-	// todo: go func content of this loop, otherwise last lines are printed one after the other
 	for i, fname := range files {
 		debug(fmt.Sprintf("main: registering tailer for %s", fname))
 
@@ -214,16 +216,18 @@ func parseFileName(s string) (string, error) {
 	return fname, nil
 }
 
-// showVersionAndExit shows version details
-func showVersionAndExit() {
-	printErr("version details will appear in the future")
-	os.Exit(0)
+// showVersion shows version details
+func showVersion() {
+	printErr(fmt.Sprintf("tailf %s.%s", Version, Build))
 }
 
-// showUsageAndExit <- take a wild guess
-func showUsageAndExit() {
-	printErr("usage details will appear in the future")
-	os.Exit(0)
+// showUsage <- take a wild guess
+func showUsage() {
+	showVersion()
+	printErr("")
+	printErr("Usage: tailf [OPTION]... [FILE]...")
+	printErr("A not so serious try at implementing tail -f in Go")
+	printErr("Why are you using this? Go back to tail.. Go!")
 }
 
 // printErr prints the given message to stderr
